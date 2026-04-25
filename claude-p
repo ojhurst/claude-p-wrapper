@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+"""
+claude-p — drop-in wrapper for `claude -p` (non-interactive Claude CLI).
+
+Logs every call to ~/apps/cc/logs/claude-p-usage.log as JSON lines:
+  {"ts": "...", "caller": "...", "prompt_chars": N, "elapsed_s": N.N, "exit_code": N, "count_this_hour": N}
+
+Two-tier rate alerting:
+  100/hour  — warning email (call still proceeds)
+  400/hour  — critical email + call is suppressed (returns exit 0, empty stdout)
+
+Emails are sent via the Gmail API using ~/apps/gmail-helper/token.json.
+An email is sent at most once per hour per tier to avoid flooding.
+
+Usage (identical to `claude -p` without the `-p` flag):
+  claude-p [flags] "prompt text"
+  claude-p [flags] < stdin_prompt
+
+Scripts should call this instead of `claude -p`. This wrapper prepends `-p` automatically.
+"""
+
+import base64
+import email.mime.text
+import hashlib
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+WRAPPER_VERSION = 4
+LOG_TZ = ZoneInfo("America/Denver")  # Utah Mountain Time, DST-aware
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+LOG_FILE    = Path.home() / "apps/cc/logs/claude-p-usage.log"
+RATE_FILE   = Path("/tmp/claude-p-rate")        # "YYYY-MM-DDTHH,count"
+ALERT_FILE  = Path("/tmp/claude-p-alert")       # "YYYY-MM-DDTHH,tier" — last email sent
+ALERT_FROM  = "Claude <noreply@example.com>"
+ALERT_TO    = "you@example.com"
+
+WARN_LIMIT  = 100   # send warning email, call proceeds
+HARD_LIMIT  = 400   # send critical email, call is suppressed
+
+# Callers that bypass HARD_LIMIT suppression. Reserved for event-driven,
+# low-volume callers where every call corresponds to a real user action
+# (e.g. one screenshot = one rename). Timer-driven callers must not be exempted.
+EXEMPT_CALLERS = {"rename.py"}
+
+# ── Rate tracking ─────────────────────────────────────────────────────────────
+
+def current_hour_key() -> str:
+    return datetime.now().strftime("%Y-%m-%dT%H")
+
+def get_count() -> int:
+    key = current_hour_key()
+    try:
+        if RATE_FILE.exists():
+            stored_key, n = RATE_FILE.read_text().strip().split(",", 1)
+            return int(n) if stored_key == key else 0
+    except Exception:
+        pass
+    return 0
+
+def increment_count() -> int:
+    key = current_hour_key()
+    count = get_count() + 1
+    try:
+        RATE_FILE.write_text(f"{key},{count}")
+    except Exception:
+        pass
+    return count
+
+# ── Gmail alert ───────────────────────────────────────────────────────────────
+
+def _resend_api_key() -> str:
+    """Pull RESEND_API_KEY from the shared secrets vault."""
+    try:
+        return subprocess.check_output(
+            ["python3", os.path.expanduser("~/apps/cc/secrets/secrets_cli.py"),
+             "get", "RESEND_API_KEY"],
+            text=True, timeout=5,
+        ).strip()
+    except Exception:
+        return ""
+
+
+def send_alert_email(subject: str, body: str):
+    """Send via Resend. Same pattern as claude-code-crm/notify.py. No OAuth,
+    no token refresh — just a bearer-token POST."""
+    key = _resend_api_key()
+    if not key:
+        return
+    payload = json.dumps({
+        "from": ALERT_FROM,
+        "to": [ALERT_TO],
+        "subject": subject,
+        "text": body,
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.resend.com/emails",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "User-Agent": "claude-p-wrapper/1.0",
+        },
+        method="POST",
+    )
+    try:
+        urllib.request.urlopen(req, timeout=10)
+    except Exception as e:
+        # Surface the failure reason in the trace log so next time we know.
+        try:
+            with open("/tmp/claude-p-email.log", "a") as f:
+                f.write(f"[{datetime.now(LOG_TZ).isoformat()}] send failed: {e}\n")
+        except Exception:
+            pass
+
+def maybe_alert(count: int, caller: str):
+    """Send an email alert if we just crossed a threshold — at most once per hour per tier."""
+    key = current_hour_key()
+    try:
+        stored = ALERT_FILE.read_text().strip() if ALERT_FILE.exists() else ""
+        stored_key, stored_tier = stored.split(",", 1) if "," in stored else ("", "")
+    except Exception:
+        stored_key, stored_tier = "", ""
+
+    tier = None
+    if count == HARD_LIMIT:
+        tier = "critical"
+    elif count == WARN_LIMIT:
+        tier = "warning"
+
+    if tier is None:
+        return
+
+    if stored_key == key and stored_tier == tier:
+        return  # already emailed this tier this hour
+
+    ALERT_FILE.write_text(f"{key},{tier}")
+
+    hour_label = datetime.now().strftime("%-I %p")
+    if tier == "critical":
+        subject = f"[claude-p] CRITICAL: {count} calls this hour — suppressing further calls"
+        body = (
+            f"claude -p has been called {count} times this hour (threshold: {HARD_LIMIT}).\n\n"
+            f"Caller that triggered: {caller}\n"
+            f"Hour: {hour_label}\n\n"
+            f"Further calls are now suppressed until the next clock-hour.\n"
+            f"Run: python3 ~/apps/claude-p-wrapper/claude-p-report --hours 1\n"
+            f"to see the full breakdown."
+        )
+    else:
+        subject = f"[claude-p] WARNING: {count} calls this hour"
+        body = (
+            f"claude -p has been called {count} times this hour (warning threshold: {WARN_LIMIT}).\n\n"
+            f"Caller that triggered: {caller}\n"
+            f"Hour: {hour_label}\n\n"
+            f"Calls are still proceeding. Hard limit is {HARD_LIMIT}/hour.\n"
+            f"Run: python3 ~/apps/claude-p-wrapper/claude-p-report --hours 1\n"
+            f"to see the full breakdown."
+        )
+
+    send_alert_email(subject, body)
+
+# ── Caller detection ──────────────────────────────────────────────────────────
+
+def detect_caller() -> str:
+    try:
+        ppid = os.getppid()
+        out = subprocess.check_output(
+            ["ps", "-p", str(ppid), "-o", "command="], text=True, timeout=2
+        ).strip()
+        parts = out.split()
+        for part in parts:
+            if part.endswith((".py", ".sh")):
+                return Path(part).name
+        return parts[0] if parts else "unknown"
+    except Exception:
+        return "unknown"
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+
+def log(entry: dict):
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with LOG_FILE.open("a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def parse_model(args):
+    """Extract --model value from argv, or return 'default'."""
+    for i, a in enumerate(args):
+        if a == "--model" and i + 1 < len(args):
+            return args[i + 1]
+        if a.startswith("--model="):
+            return a.split("=", 1)[1]
+    return "default"
+
+
+def process_ancestry(max_depth=6):
+    """Walk up the process tree. Returns a list of short command names
+    from parent → ancestor, e.g. ['nudge_ai_classify.py', 'nudge-clear-on-stop.sh', 'claude']."""
+    chain = []
+    try:
+        pid = os.getppid()
+        for _ in range(max_depth):
+            if pid <= 1:
+                break
+            out = subprocess.check_output(
+                ["ps", "-p", str(pid), "-o", "ppid=,command="],
+                text=True, timeout=1,
+            ).strip()
+            if not out:
+                break
+            parts = out.split(maxsplit=1)
+            if len(parts) < 2:
+                break
+            ppid_str, cmdline = parts
+            toks = cmdline.split()
+            short = None
+            for tok in toks:
+                if tok.endswith((".py", ".sh")):
+                    short = Path(tok).name
+                    break
+            if not short:
+                short = Path(toks[0]).name if toks else "?"
+            chain.append(short)
+            try:
+                pid = int(ppid_str)
+            except ValueError:
+                break
+    except Exception:
+        pass
+    return chain
+
+
+def machine_tag():
+    """Short machine label, matching the convention in the global CLAUDE.md."""
+    try:
+        name = subprocess.check_output(
+            ["scutil", "--get", "ComputerName"], text=True, timeout=1
+        ).strip()
+    except Exception:
+        name = socket.gethostname()
+    lower = name.lower()
+    if "studio" in lower: return "Studio"
+    if "macbook" in lower or "mbp" in lower: return "MBP"
+    if "remote" in lower: return "RemoteMac"
+    return name
+
+
+def classify_error(exit_code: int, stderr_tail: str) -> str:
+    """Categorize the call result. We pass stdout through unchanged so we
+    do not capture its length; rely on exit_code + stderr text alone."""
+    if exit_code == 0:
+        return "ok"
+    if "command not found" in stderr_tail or "No such file" in stderr_tail:
+        return "cli_missing"
+    lower = stderr_tail.lower()
+    if "rate" in lower and "limit" in lower:
+        return "rate_limit"
+    if "timed out" in lower or "timeout" in lower:
+        return "timeout"
+    return "nonzero"
+
+
+def main():
+    args = sys.argv[1:]
+    caller = detect_caller()
+    sid = (
+        os.environ.get("CLAUDE_SESSION_ID")
+        or os.environ.get("CLAUDECODE_SESSION_ID")
+        or os.environ.get("SID")
+        or ""
+    )[:8] or "none"
+
+    call_id = uuid.uuid4().hex[:12]
+    now_iso = datetime.now(LOG_TZ).isoformat()
+
+    # Count BEFORE the call to get the post-increment value
+    count = increment_count()
+
+    # Fire alert if we just crossed a threshold
+    maybe_alert(count, caller)
+
+    # Read stdin if piped + measure argv
+    stdin_data = b""
+    if not sys.stdin.isatty():
+        stdin_data = sys.stdin.buffer.read()
+    argv_prompt = " ".join(a for a in args if not a.startswith("-"))
+    argv_chars = len(argv_prompt)
+    prompt_chars = len(stdin_data) + argv_chars
+
+    # Human-readable sample for debugging (argv first, then stdin)
+    preview_source = argv_prompt
+    if stdin_data:
+        stdin_text = stdin_data.decode("utf-8", errors="replace")
+        preview_source = (argv_prompt + "\n" + stdin_text).strip() if argv_prompt else stdin_text
+    prompt_preview = preview_source[:300]
+
+    # Fingerprint the prompt for dedupe visibility
+    h = hashlib.sha256()
+    h.update(stdin_data)
+    for a in args:
+        if not a.startswith("-"):
+            h.update(a.encode("utf-8", errors="replace"))
+    prompt_sha = h.hexdigest()[:16]
+
+    base_entry = {
+        "ts":             now_iso,
+        "call_id":        call_id,
+        "wrapper_version": WRAPPER_VERSION,
+        "machine":        machine_tag(),
+        "caller":         caller,
+        "ancestry":       process_ancestry(),
+        "cwd":            os.getcwd(),
+        "sid":            sid,
+        "model":          parse_model(args),
+        "purpose":        os.environ.get("CLAUDE_P_PURPOSE", ""),
+        "prompt_chars":   prompt_chars,
+        "prompt_sha":     prompt_sha,
+        "prompt_preview": prompt_preview,
+        "count_this_hour": count,
+    }
+
+    # Suppress if over hard limit — unless caller is on the event-driven allowlist
+    if count > HARD_LIMIT and caller not in EXEMPT_CALLERS:
+        log({**base_entry, "suppressed": True, "error_category": "rate_limit"})
+        sys.exit(0)
+    if count > HARD_LIMIT and caller in EXEMPT_CALLERS:
+        base_entry["exempt"] = True
+
+    # Find real claude binary
+    real_claude = subprocess.run(
+        ["which", "claude"], capture_output=True, text=True
+    ).stdout.strip() or "claude"
+
+    cmd = [real_claude, "-p"] + args
+
+    start = time.monotonic()
+    stderr_buf = b""
+    try:
+        # Capture stderr so we can tag rate-limit / cli-missing / etc.
+        # Forward stdout unchanged so callers keep getting claude's output.
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        _, stderr_buf = proc.communicate(input=stdin_data)
+        exit_code = proc.returncode
+    except Exception as e:
+        exit_code = 1
+        stderr_buf = f"[claude-p] error: {e}".encode()
+        sys.stderr.write(stderr_buf.decode(errors="replace") + "\n")
+
+    # Forward stderr to our stderr so callers that grep it still see it
+    if stderr_buf:
+        sys.stderr.buffer.write(stderr_buf)
+        sys.stderr.flush()
+
+    elapsed = round(time.monotonic() - start, 2)
+    stderr_tail = stderr_buf.decode(errors="replace")[-400:]
+    error_category = classify_error(exit_code, stderr_tail)
+
+    log({
+        **base_entry,
+        "elapsed_s":       elapsed,
+        "exit_code":       exit_code,
+        "stderr_tail":     stderr_tail,
+        "error_category":  error_category,
+    })
+    sys.exit(exit_code)
+
+
+if __name__ == "__main__":
+    main()
