@@ -345,7 +345,16 @@ def main():
         ["which", "claude"], capture_output=True, text=True
     ).stdout.strip() or "claude"
 
-    cmd = [real_claude, "-p"] + args
+    # Suppress per-call session JSONLs unless caller opts in. The whole point
+    # of `claude -p` is one-shot, so persisted sessions clutter the VS Code
+    # sidebar (281 stale rename entries observed 2026-05-03). CLAUDE_P_PERSIST=1
+    # is the escape hatch; passing --no-session-persistence already in args
+    # also wins (idempotent).
+    persist_opt_in = os.environ.get("CLAUDE_P_PERSIST", "").strip().lower() in ("1", "true", "yes")
+    suppress_persistence = (not persist_opt_in) and ("--no-session-persistence" not in args)
+    extra_flags = ["--no-session-persistence"] if suppress_persistence else []
+    base_entry["persist"] = not suppress_persistence
+    cmd = [real_claude, "-p"] + extra_flags + args
 
     start = time.monotonic()
     stderr_buf = b""
