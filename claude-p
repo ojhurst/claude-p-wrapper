@@ -2,7 +2,7 @@
 """
 claude-p — drop-in wrapper for `claude -p` (non-interactive Claude CLI).
 
-Logs every call to ~/apps/cc/logs/claude-p-usage.log as JSON lines:
+Logs every call to ~/apps/claude-p-wrapper/logs/claude-p-usage.log as JSON lines:
   {"ts": "...", "caller": "...", "prompt_chars": N, "elapsed_s": N.N, "exit_code": N, "count_this_hour": N}
 
 Two-tier rate alerting:
@@ -41,9 +41,22 @@ LOG_TZ = ZoneInfo("America/Denver")  # Utah Mountain Time, DST-aware
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-LOG_FILE    = Path.home() / "apps/cc/logs/claude-p-usage.log"
+REPO_DIR    = Path(__file__).resolve().parent
+LOG_FILE    = REPO_DIR / "logs/claude-p-usage.log"
 RATE_FILE   = Path("/tmp/claude-p-rate")        # "YYYY-MM-DDTHH,count"
 ALERT_FILE  = Path("/tmp/claude-p-alert")       # "YYYY-MM-DDTHH,tier" — last email sent
+SECRET_FILES = (
+    REPO_DIR / "secrets.env",
+    REPO_DIR / ".env",
+    Path.home() / "Library/CloudStorage/GoogleDrive-you@example.com/My Drive/2 Areas/Personal Systems/shared-secrets.env",
+)
+JSON_SECRET_FILES = (
+    REPO_DIR / "secrets.json",
+    REPO_DIR / "shared-secrets.json",
+    Path.home() / "apps/cc/secrets/shared-secrets.json",
+    Path.home() / "apps/cc/secrets/secrets.json",
+    Path.home() / "Library/CloudStorage/GoogleDrive-you@example.com/My Drive/2 Areas/Personal Systems/shared-secrets.json",
+)
 ALERT_FROM  = "Claude <noreply@example.com>"
 ALERT_TO    = "you@example.com"
 
@@ -82,15 +95,36 @@ def increment_count() -> int:
 # ── Gmail alert ───────────────────────────────────────────────────────────────
 
 def _resend_api_key() -> str:
-    """Pull RESEND_API_KEY from the shared secrets vault."""
-    try:
-        return subprocess.check_output(
-            ["python3", os.path.expanduser("~/apps/cc/secrets/secrets_cli.py"),
-             "get", "RESEND_API_KEY"],
-            text=True, timeout=5,
-        ).strip()
-    except Exception:
-        return ""
+    """Pull RESEND_API_KEY from env or a local ignored secrets file."""
+    key = os.environ.get("RESEND_API_KEY", "").strip()
+    if key:
+        return key
+    for path in JSON_SECRET_FILES:
+        if not path.exists():
+            continue
+        try:
+            data = json.loads(path.read_text())
+            key = data.get("RESEND_API_KEY") or data.get("resend_api_key")
+            if key:
+                return str(key).strip()
+        except Exception:
+            pass
+    for path in SECRET_FILES:
+        if not path.exists():
+            continue
+        try:
+            for line in path.read_text().splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("export "):
+                    line = line[len("export "):]
+                if not line.startswith("RESEND_API_KEY="):
+                    continue
+                return line.split("=", 1)[1].strip().strip("'").strip('"')
+        except Exception:
+            pass
+    return ""
 
 
 def send_alert_email(subject: str, body: str):
@@ -260,8 +294,12 @@ def machine_tag():
 
 
 def classify_error(exit_code: int, stderr_tail: str) -> str:
-    """Categorize the call result. We pass stdout through unchanged so we
-    do not capture its length; rely on exit_code + stderr text alone."""
+    """Categorize the call result by exit_code + stderr text.
+
+    Auth-failure detection happens separately on stdout (see is_auth_failure)
+    because the CLI returns exit 0 + JSON-shaped success envelope with
+    `is_error:true` on auth lapse — exit_code alone never sees it.
+    """
     if exit_code == 0:
         return "ok"
     if "command not found" in stderr_tail or "No such file" in stderr_tail:
@@ -272,6 +310,83 @@ def classify_error(exit_code: int, stderr_tail: str) -> str:
     if "timed out" in lower or "timeout" in lower:
         return "timeout"
     return "nonzero"
+
+
+# Exit code for auth-failure suppression. Picked 78 (sysexits EX_CONFIG) so
+# callers can distinguish "auth lapsed, nothing to do but /login" from a real
+# CLI crash. Most callers just check `returncode != 0` and fall through to
+# their own error path, which is the desired fail-closed behavior.
+AUTH_FAILURE_EXIT = 78
+AUTH_FAILURE_MARKER = "Not logged in"
+
+
+def is_auth_failure(stdout_bytes: bytes) -> bool:
+    """Detect the unauthenticated-CLI JSON shape.
+
+    `claude -p --output-format json` on an unauthenticated CLI returns:
+        {"type":"result","subtype":"success","is_error":true,
+         "result":"Not logged in · Please run /login",
+         "stop_reason":"stop_sequence","total_cost_usd":0,
+         "usage":{"input_tokens":0,...},...}
+
+    Three signals checked together so we never false-positive on real model
+    output that happens to mention the phrase: is_error:true AND result
+    starts with "Not logged in" AND zero input_tokens (real calls always
+    have a positive prompt token count).
+    """
+    if not stdout_bytes:
+        return False
+    text = stdout_bytes.decode("utf-8", errors="ignore").strip()
+    if not text.startswith("{"):
+        return False
+    try:
+        data = json.loads(text)
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    if not data.get("is_error"):
+        return False
+    result = data.get("result") or ""
+    if not isinstance(result, str) or not result.startswith(AUTH_FAILURE_MARKER):
+        return False
+    usage = data.get("usage") or {}
+    if isinstance(usage, dict) and usage.get("input_tokens", 0) > 0:
+        return False
+    return True
+
+
+def maybe_alert_auth_failure(machine: str) -> None:
+    """Send at most one auth-failure email per hour per machine, same shape
+    as the rate-limit alerter. Quiet on disk if alerter can't reach Resend —
+    the stderr line is the user-visible signal."""
+    key = current_hour_key()
+    flag = Path(f"/tmp/claude-p-auth-alert-{machine}")
+    try:
+        if flag.exists() and flag.read_text().strip() == key:
+            return
+    except Exception:
+        pass
+    try:
+        flag.write_text(key)
+    except Exception:
+        pass
+    try:
+        send_alert_email(
+            subject=f"[claude-p] auth lapsed on {machine}",
+            body=(
+                f"`claude -p` on {machine} is returning is_error:true with "
+                f'result="Not logged in · Please run /login".\n\n'
+                "Open Terminal on that machine and run:\n"
+                "  claude /login\n\n"
+                "Until then, every claude-p call from that machine is "
+                "exiting with code 78 (auth_failure). Any caller that "
+                "ignored exit codes and consumed `result` would have "
+                "captured the 'Not logged in' string as a result.\n"
+            ),
+        )
+    except Exception:
+        pass
 
 
 def main():
@@ -358,18 +473,50 @@ def main():
 
     start = time.monotonic()
     stderr_buf = b""
+    stdout_buf = b""
     try:
-        # Capture stderr so we can tag rate-limit / cli-missing / etc.
-        # Forward stdout unchanged so callers keep getting claude's output.
+        # Capture stdout AND stderr so we can detect the auth-failure JSON
+        # shape (exit 0 + is_error:true) before forwarding. Pre-Build 7 we
+        # streamed stdout via inherit; that let "Not logged in" responses
+        # leak straight to callers, which the namer then treated as a real
+        # title. See RCA 2026-05-07.
         proc = subprocess.Popen(
-            cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE,
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
-        _, stderr_buf = proc.communicate(input=stdin_data)
+        stdout_buf, stderr_buf = proc.communicate(input=stdin_data)
         exit_code = proc.returncode
     except Exception as e:
         exit_code = 1
         stderr_buf = f"[claude-p] error: {e}".encode()
         sys.stderr.write(stderr_buf.decode(errors="replace") + "\n")
+
+    # Auth-failure suppression: if the CLI's stdout JSON envelope says
+    # is_error:true with "Not logged in" result, treat the call as failed
+    # regardless of exit code (the CLI returns exit 1, but every caller
+    # parses stdout independently of returncode and would still capture
+    # the auth-error string). Forward an empty stdout, write a clear
+    # stderr line, exit AUTH_FAILURE_EXIT (78) so callers fail closed.
+    auth_failed = is_auth_failure(stdout_buf)
+    if auth_failed:
+        machine = machine_tag()
+        sys.stderr.write(
+            f"[claude-p] auth lapsed on {machine} — `claude -p` returned "
+            f'is_error:true with result="Not logged in · Please run '
+            f"/login\". Suppressing stdout and exiting {AUTH_FAILURE_EXIT}.\n"
+            f"[claude-p] Fix: open Terminal on {machine} and run `claude "
+            f"/login` to refresh the keychain credential.\n"
+        )
+        sys.stderr.flush()
+        maybe_alert_auth_failure(machine)
+        exit_code = AUTH_FAILURE_EXIT
+    else:
+        # Forward stdout unchanged so callers keep getting claude's output.
+        if stdout_buf:
+            sys.stdout.buffer.write(stdout_buf)
+            sys.stdout.flush()
 
     # Forward stderr to our stderr so callers that grep it still see it
     if stderr_buf:
@@ -378,7 +525,10 @@ def main():
 
     elapsed = round(time.monotonic() - start, 2)
     stderr_tail = stderr_buf.decode(errors="replace")[-400:]
-    error_category = classify_error(exit_code, stderr_tail)
+    error_category = (
+        "auth_failure" if auth_failed
+        else classify_error(exit_code, stderr_tail)
+    )
 
     log({
         **base_entry,
