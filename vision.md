@@ -11,7 +11,7 @@ Until now every script rolled its own `subprocess.run(["claude", "-p", ...])` wi
 A single wrapper executable — `claude-p` — that every automation script calls instead of `claude -p` directly. It:
 
 1. Forwards every invocation to the real Claude CLI unchanged, so it is a true drop-in.
-2. Logs structured JSON lines to `~/apps/cc/logs/claude-p-usage.log` with enough detail to audit any call after the fact.
+2. Logs structured JSON lines to `~/apps/claude-p-wrapper/logs/claude-p-usage.log` with enough detail to audit any call after the fact.
 3. Tracks calls per hour and fires Gmail alerts at a warning tier (100/hr) and a critical tier (400/hr), suppressing further calls beyond the critical tier.
 4. Ships with a companion `claude-p-report` that summarizes usage by model, by caller, by hour, and by purpose.
 
@@ -36,5 +36,5 @@ A single wrapper executable — `claude-p` — that every automation script call
 
 - The wrapper never drops a call silently except at the hard cap, and the hard-cap suppression is logged.
 - The log is append-only JSONL. Old lines keep their schema; new fields are additive. `wrapper_version` on every line makes schema changes safe.
-- The wrapper lives in its own repo so its build number and commit history tell a clean story, separate from the cc repo's hook noise.
+- The wrapper lives in its own repo so its build number, logs, and commit history tell a clean story.
 - No paid API fallback. If `claude -p` is down, the wrapper logs the failure and returns a nonzero exit. Callers decide what to do.

@@ -14,8 +14,9 @@ Single-file Python 3 script. No dependencies beyond the stdlib. Runs on macOS an
 
 - `claude-p` — the wrapper executable
 - `claude-p-report` — companion script that summarizes the JSONL log by caller, model, and hour
-- `~/apps/cc/bin/claude-p` and `~/apps/cc/bin/claude-p-report` are symlinks into this repo so existing call sites keep working unchanged
-- The log lives outside this repo at `~/apps/cc/logs/claude-p-usage.log` so the daily reflection and other readers can find it where they always have
+- Call sites should invoke `~/apps/claude-p-wrapper/claude-p` directly or put `~/apps/claude-p-wrapper` on PATH.
+- The usage log lives in this repo at `~/apps/claude-p-wrapper/logs/claude-p-usage.log`.
+- Alert email uses `RESEND_API_KEY` from the environment, local JSON/env secret files, or James's shared secret files; local secret files are ignored by git.
 
 ## Rate Limits
 
@@ -37,6 +38,5 @@ Single-file Python 3 script. No dependencies beyond the stdlib. Runs on macOS an
 
 ## Deploy
 
-- Push to GitHub, then `git pull` on every machine that has `~/apps/claude-p-wrapper`
-- After every `git push`, run `bash ~/apps/cc/post-push-sync.sh` (or use `gpush`) to sync other machines
-- The symlinks in `cc/bin/` are tracked by the `cc` repo, not this one — they only need to land once per machine
+- Push to GitHub, then `git pull` on every machine that has `~/apps/claude-p-wrapper`.
+- Update call sites to point at `~/apps/claude-p-wrapper/claude-p` or include this repo on PATH.

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-claude-p-report — summarize ~/apps/cc/logs/claude-p-usage.log
+claude-p-report — summarize ~/apps/claude-p-wrapper/logs/claude-p-usage.log
 
 Usage:
   claude-p-report           # today's calls
@@ -14,7 +14,7 @@ from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-LOG_FILE = Path.home() / "apps/cc/logs/claude-p-usage.log"
+LOG_FILE = Path(__file__).resolve().parent / "logs/claude-p-usage.log"
 
 def parse_args():
     hours = 24
