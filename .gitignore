@@ -3,3 +3,8 @@ __pycache__/
 .DS_Store
 *.swp
 .venv/
+logs/
+secrets.env
+.env
+secrets.json
+shared-secrets.json
