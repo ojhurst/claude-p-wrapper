@@ -28,9 +28,6 @@ import socket
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,20 +42,8 @@ REPO_DIR    = Path(__file__).resolve().parent
 LOG_FILE    = REPO_DIR / "logs/claude-p-usage.log"
 RATE_FILE   = Path("/tmp/claude-p-rate")        # "YYYY-MM-DDTHH,count"
 ALERT_FILE  = Path("/tmp/claude-p-alert")       # "YYYY-MM-DDTHH,tier" — last email sent
-SECRET_FILES = (
-    REPO_DIR / "secrets.env",
-    REPO_DIR / ".env",
-    Path.home() / "Library/CloudStorage/GoogleDrive-you@example.com/My Drive/2 Areas/Personal Systems/shared-secrets.env",
-)
-JSON_SECRET_FILES = (
-    REPO_DIR / "secrets.json",
-    REPO_DIR / "shared-secrets.json",
-    Path.home() / "apps/cc/secrets/shared-secrets.json",
-    Path.home() / "apps/cc/secrets/secrets.json",
-    Path.home() / "Library/CloudStorage/GoogleDrive-you@example.com/My Drive/2 Areas/Personal Systems/shared-secrets.json",
-)
-ALERT_FROM  = "Claude <noreply@example.com>"
 ALERT_TO    = "you@example.com"
+NOTIFY      = Path.home() / "apps" / "gmail-notify" / "send-email.py"
 
 WARN_LIMIT  = 100   # send warning email, call proceeds
 HARD_LIMIT  = 400   # send critical email, call is suppressed
@@ -94,68 +79,34 @@ def increment_count() -> int:
 
 # ── Gmail alert ───────────────────────────────────────────────────────────────
 
-def _resend_api_key() -> str:
-    """Pull RESEND_API_KEY from env or a local ignored secrets file."""
-    key = os.environ.get("RESEND_API_KEY", "").strip()
-    if key:
-        return key
-    for path in JSON_SECRET_FILES:
-        if not path.exists():
-            continue
-        try:
-            data = json.loads(path.read_text())
-            key = data.get("RESEND_API_KEY") or data.get("resend_api_key")
-            if key:
-                return str(key).strip()
-        except Exception:
-            pass
-    for path in SECRET_FILES:
-        if not path.exists():
-            continue
-        try:
-            for line in path.read_text().splitlines():
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if line.startswith("export "):
-                    line = line[len("export "):]
-                if not line.startswith("RESEND_API_KEY="):
-                    continue
-                return line.split("=", 1)[1].strip().strip("'").strip('"')
-        except Exception:
-            pass
-    return ""
-
-
 def send_alert_email(subject: str, body: str):
-    """Send via Resend. Same pattern as claude-code-crm/notify.py. No OAuth,
-    no token refresh — just a bearer-token POST."""
-    key = _resend_api_key()
-    if not key:
-        return
-    payload = json.dumps({
-        "from": ALERT_FROM,
-        "to": [ALERT_TO],
-        "subject": subject,
-        "text": body,
-    }).encode()
-    req = urllib.request.Request(
-        "https://api.resend.com/emails",
-        data=payload,
-        headers={
-            "Authorization": f"Bearer {key}",
-            "Content-Type": "application/json",
-            "User-Agent": "claude-p-wrapper/1.0",
-        },
-        method="POST",
-    )
+    """Shell out to the canonical notify wrapper at gmail-notify/send-email.py.
+
+    Replaces an earlier inline Resend POST that defaulted to a wrong sender
+    (`noreply@example.com`) and a wrong recipient (`you@example.com`),
+    landing alerts in the DDXWeb mailbox instead of James's primary inbox.
+    The wrapper signs from `bot@example.com` and ships to
+    `you@example.com` per the Notify-James Pattern SOP.
+
+    Per SOP we do not pass the API key here — send-email.py reads RESEND_API_KEY
+    from env. We keep failure surfacing identical (write to /tmp/claude-p-email.log)
+    so the wrapper never crashes the host claude -p call on a transient send error.
+    """
     try:
-        urllib.request.urlopen(req, timeout=10)
+        proc = subprocess.run(
+            ["python3", str(NOTIFY), "--to", ALERT_TO, "--subject", subject, "--body", body],
+            capture_output=True, text=True, timeout=15,
+        )
+        if proc.returncode != 0:
+            with open("/tmp/claude-p-email.log", "a") as f:
+                f.write(
+                    f"[{datetime.now(LOG_TZ).isoformat()}] notify rc={proc.returncode} "
+                    f"stderr={proc.stderr.strip()[:300]!r}\n"
+                )
     except Exception as e:
-        # Surface the failure reason in the trace log so next time we know.
         try:
             with open("/tmp/claude-p-email.log", "a") as f:
-                f.write(f"[{datetime.now(LOG_TZ).isoformat()}] send failed: {e}\n")
+                f.write(f"[{datetime.now(LOG_TZ).isoformat()}] notify failed: {e}\n")
         except Exception:
             pass
 
