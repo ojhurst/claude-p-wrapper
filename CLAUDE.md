@@ -40,3 +40,7 @@ Single-file Python 3 script. No dependencies beyond the stdlib. Runs on macOS an
 
 - Push to GitHub, then `git pull` on every machine that has `~/apps/claude-p-wrapper`.
 - Update call sites to point at `~/apps/claude-p-wrapper/claude-p` or include this repo on PATH.
+
+
+## No time estimates, no stamina commentary
+Do not estimate how long something will take. Do not comment on James's energy, time of day, or how long the session has run. Do not suggest pausing, saving for tomorrow, or coming back fresh. James decides when he is done. Just do the next thing.
