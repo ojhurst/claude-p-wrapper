@@ -27,9 +27,11 @@ ts="$(date '+%Y-%m-%dT%H:%M:%S%z')"
 # out of rate-limit accounting and analytics.
 export CLAUDE_P_PURPOSE="auth-heartbeat"
 
-# --max-turns 1 keeps the call cheap. Empty prompt is fine — we only need
-# the CLI to authenticate, not produce a meaningful response.
-out="$("$WRAPPER" --max-turns 1 "ok" 2>&1)"
+# Trivial prompt — `claude -p` is one-shot by definition so no max-turns
+# needed. We only care whether the call succeeds (auth works) or returns
+# exit 78 (the wrapper's AUTH_FAILURE_EXIT, set by either auth-failure
+# detector). Other non-zero exits are benign for our purposes.
+out="$("$WRAPPER" "say ok" 2>&1)"
 rc=$?
 
 # Trim to 200 chars so the log stays scannable.
