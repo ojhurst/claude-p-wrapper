@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-WRAPPER_VERSION = 4
+WRAPPER_VERSION = 5
 LOG_TZ = ZoneInfo("America/Denver")  # Utah Mountain Time, DST-aware
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -269,6 +269,30 @@ def classify_error(exit_code: int, stderr_tail: str) -> str:
 # their own error path, which is the desired fail-closed behavior.
 AUTH_FAILURE_EXIT = 78
 AUTH_FAILURE_MARKER = "Not logged in"
+API_AUTH_FAILURE_MARKER = "Failed to authenticate. API Error: 401"
+
+
+def is_api_auth_failure(stdout_bytes: bytes, stderr_bytes: bytes) -> bool:
+    """Detect the server-side 401 rejection shape.
+
+    Distinct from `is_auth_failure` (the CLI's "Not logged in" JSON envelope):
+    here the CLI thinks it has credentials, submits them, and the API rejects
+    them with HTTP 401. The CLI prints
+        Failed to authenticate. API Error: 401 Invalid authentication credentials
+    to stdout (sometimes stderr) and exits non-zero.
+
+    Triggers on 2026-05-18: every claude -p call from the screenshot renamer
+    started returning this after the token was revoked server-side ~6 hours
+    into its 8-hour lifetime. Confirmed by rename.log entries with
+    stderr='' stdout='Failed to authenticate. API Error: 401 ...'.
+    """
+    for buf in (stdout_bytes, stderr_bytes):
+        if not buf:
+            continue
+        text = buf.decode("utf-8", errors="ignore")
+        if API_AUTH_FAILURE_MARKER in text:
+            return True
+    return False
 
 
 def is_auth_failure(stdout_bytes: bytes) -> bool:
@@ -307,12 +331,21 @@ def is_auth_failure(stdout_bytes: bytes) -> bool:
     return True
 
 
-def maybe_alert_auth_failure(machine: str) -> None:
-    """Send at most one auth-failure email per hour per machine, same shape
-    as the rate-limit alerter. Quiet on disk if alerter can't reach Resend —
-    the stderr line is the user-visible signal."""
+def maybe_alert_auth_failure(machine: str, mode: str = "cli") -> None:
+    """Send at most one auth-failure email per hour per machine per mode.
+
+    `mode` is "cli" for the "Not logged in" JSON envelope (CLI thinks it has
+    no credentials) or "api" for the server-side 401 rejection (CLI has
+    credentials, API rejected them). They are tracked separately because
+    they have different fixes: cli mode = /login on the machine. api mode =
+    /login OR wait for a token-revocation issue to clear (rate limit,
+    concurrent-session invalidation, expired refresh chain).
+
+    Quiet on disk if alerter can't reach Resend — the stderr line is the
+    user-visible signal.
+    """
     key = current_hour_key()
-    flag = Path(f"/tmp/claude-p-auth-alert-{machine}")
+    flag = Path(f"/tmp/claude-p-auth-alert-{machine}-{mode}")
     try:
         if flag.exists() and flag.read_text().strip() == key:
             return
@@ -322,20 +355,34 @@ def maybe_alert_auth_failure(machine: str) -> None:
         flag.write_text(key)
     except Exception:
         pass
-    try:
-        send_alert_email(
-            subject=f"[claude-p] auth lapsed on {machine}",
-            body=(
-                f"`claude -p` on {machine} is returning is_error:true with "
-                f'result="Not logged in · Please run /login".\n\n'
-                "Open Terminal on that machine and run:\n"
-                "  claude /login\n\n"
-                "Until then, every claude-p call from that machine is "
-                "exiting with code 78 (auth_failure). Any caller that "
-                "ignored exit codes and consumed `result` would have "
-                "captured the 'Not logged in' string as a result.\n"
-            ),
+    if mode == "api":
+        subject = f"[claude-p] API 401 on {machine} — token rejected"
+        body = (
+            f"`claude -p` on {machine} is hitting HTTP 401 from the API:\n"
+            f'    Failed to authenticate. API Error: 401 Invalid authentication credentials\n\n'
+            "The CLI has credentials but the server is rejecting them. "
+            "Common causes: token revoked by a concurrent login on another "
+            "machine, rate-limit-driven invalidation, or a refresh token "
+            "that lost its chain.\n\n"
+            "Fix: open Terminal on that machine and run:\n"
+            "  claude /login\n\n"
+            "Until then, every claude-p call from that machine is exiting "
+            "with code 78 (api_auth_failure).\n"
         )
+    else:
+        subject = f"[claude-p] auth lapsed on {machine}"
+        body = (
+            f"`claude -p` on {machine} is returning is_error:true with "
+            f'result="Not logged in · Please run /login".\n\n'
+            "Open Terminal on that machine and run:\n"
+            "  claude /login\n\n"
+            "Until then, every claude-p call from that machine is "
+            "exiting with code 78 (auth_failure). Any caller that "
+            "ignored exit codes and consumed `result` would have "
+            "captured the 'Not logged in' string as a result.\n"
+        )
+    try:
+        send_alert_email(subject=subject, body=body)
     except Exception:
         pass
 
@@ -451,6 +498,7 @@ def main():
     # the auth-error string). Forward an empty stdout, write a clear
     # stderr line, exit AUTH_FAILURE_EXIT (78) so callers fail closed.
     auth_failed = is_auth_failure(stdout_buf)
+    api_auth_failed = (not auth_failed) and is_api_auth_failure(stdout_buf, stderr_buf)
     if auth_failed:
         machine = machine_tag()
         sys.stderr.write(
@@ -461,10 +509,24 @@ def main():
             f"/login` to refresh the keychain credential.\n"
         )
         sys.stderr.flush()
-        maybe_alert_auth_failure(machine)
+        maybe_alert_auth_failure(machine, mode="cli")
+        exit_code = AUTH_FAILURE_EXIT
+    elif api_auth_failed:
+        machine = machine_tag()
+        sys.stderr.write(
+            f"[claude-p] API 401 on {machine} — server rejected the token "
+            f"with `Failed to authenticate. API Error: 401`. Suppressing "
+            f"stdout and exiting {AUTH_FAILURE_EXIT}.\n"
+            f"[claude-p] Fix: open Terminal on {machine} and run `claude "
+            f"/login` to mint a fresh OAuth token.\n"
+        )
+        sys.stderr.flush()
+        maybe_alert_auth_failure(machine, mode="api")
         exit_code = AUTH_FAILURE_EXIT
     else:
         # Forward stdout unchanged so callers keep getting claude's output.
+        # auth_failed / api_auth_failed cases above intentionally drop stdout
+        # to prevent callers from consuming the auth-error string as a result.
         if stdout_buf:
             sys.stdout.buffer.write(stdout_buf)
             sys.stdout.flush()
@@ -478,6 +540,7 @@ def main():
     stderr_tail = stderr_buf.decode(errors="replace")[-400:]
     error_category = (
         "auth_failure" if auth_failed
+        else "api_auth_failure" if api_auth_failed
         else classify_error(exit_code, stderr_tail)
     )
 
