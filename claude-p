@@ -296,22 +296,28 @@ def is_api_auth_failure(stdout_bytes: bytes, stderr_bytes: bytes) -> bool:
 
 
 def is_auth_failure(stdout_bytes: bytes) -> bool:
-    """Detect the unauthenticated-CLI JSON shape.
+    """Detect either unauthenticated-CLI shape.
 
-    `claude -p --output-format json` on an unauthenticated CLI returns:
+    Shape 1 — JSON envelope (CLI thinks it has creds, then realizes they are bad):
         {"type":"result","subtype":"success","is_error":true,
          "result":"Not logged in · Please run /login",
          "stop_reason":"stop_sequence","total_cost_usd":0,
          "usage":{"input_tokens":0,...},...}
 
-    Three signals checked together so we never false-positive on real model
-    output that happens to mention the phrase: is_error:true AND result
-    starts with "Not logged in" AND zero input_tokens (real calls always
-    have a positive prompt token count).
+    Shape 2 — plain text (CLI has no credentials file at all, prints
+    "Not logged in · Please run /login" to stdout and exits non-zero).
+    The "· Please run /login" suffix makes this hard to confuse with
+    real model output.
     """
     if not stdout_bytes:
         return False
     text = stdout_bytes.decode("utf-8", errors="ignore").strip()
+
+    # Shape 2: plain-text fallback
+    if text.startswith("Not logged in · Please run /login"):
+        return True
+
+    # Shape 1: JSON envelope
     if not text.startswith("{"):
         return False
     try:
