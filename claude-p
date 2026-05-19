@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-WRAPPER_VERSION = 5
+WRAPPER_VERSION = 6
 LOG_TZ = ZoneInfo("America/Denver")  # Utah Mountain Time, DST-aware
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -499,6 +499,52 @@ def main():
     # stderr line, exit AUTH_FAILURE_EXIT (78) so callers fail closed.
     auth_failed = is_auth_failure(stdout_buf)
     api_auth_failed = (not auth_failed) and is_api_auth_failure(stdout_buf, stderr_buf)
+
+    # Auto-recovery: if auth failed, pull fresh credentials from Parameter Store
+    # and retry the call once. Skipped if CLAUDE_P_NO_RECOVER=1 (used by tests
+    # that need to observe the raw auth-failure path).
+    recovery_attempted = False
+    recovery_succeeded = False
+    if (auth_failed or api_auth_failed) and not os.environ.get("CLAUDE_P_NO_RECOVER"):
+        pull_script = Path.home() / "apps" / "cc" / "recipes" / "claude-creds-pull.sh"
+        if pull_script.exists():
+            recovery_attempted = True
+            try:
+                pull_proc = subprocess.run(
+                    ["bash", str(pull_script)],
+                    capture_output=True, text=True, timeout=30,
+                )
+                if pull_proc.returncode == 0:
+                    sys.stderr.write(
+                        "[claude-p] auth lapsed; pulled fresh credentials from "
+                        "Parameter Store, retrying once.\n"
+                    )
+                    sys.stderr.flush()
+                    retry_proc = subprocess.Popen(
+                        cmd,
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                    )
+                    stdout_buf2, stderr_buf2 = retry_proc.communicate(input=stdin_data)
+                    retry_exit = retry_proc.returncode
+                    if not is_auth_failure(stdout_buf2) and not is_api_auth_failure(stdout_buf2, stderr_buf2):
+                        stdout_buf, stderr_buf = stdout_buf2, stderr_buf2
+                        exit_code = retry_exit
+                        auth_failed = False
+                        api_auth_failed = False
+                        recovery_succeeded = True
+                else:
+                    sys.stderr.write(
+                        f"[claude-p] auth lapsed; Parameter Store pull failed "
+                        f"(rc={pull_proc.returncode}). Falling through to alert.\n"
+                    )
+            except Exception as e:
+                sys.stderr.write(f"[claude-p] recovery error: {e}\n")
+
+    base_entry["recovery_attempted"] = recovery_attempted
+    base_entry["recovery_succeeded"] = recovery_succeeded
+
     if auth_failed:
         machine = machine_tag()
         sys.stderr.write(
