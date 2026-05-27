@@ -459,10 +459,30 @@ def main():
     if count > HARD_LIMIT and caller in EXEMPT_CALLERS:
         base_entry["exempt"] = True
 
-    # Find real claude binary
+    # Find real claude binary. `which claude` works fine in an interactive
+    # shell, but returns empty under launchd's stripped PATH and over
+    # non-interactive SSH — both common for daemon callers like the
+    # screenshot clipboard-watcher. When `which` comes up empty, probe the
+    # locations Claude Code ships to in priority order. Bare "claude" is the
+    # last-ditch fallback so subprocess.Popen below at least emits a clear
+    # FileNotFoundError instead of silently picking the wrong binary.
+    # Diagnosed 2026-05-27 when screenshot renames silently fell back to
+    # Ollama on the MBP because the launchd daemon could not find claude.
     real_claude = subprocess.run(
         ["which", "claude"], capture_output=True, text=True
-    ).stdout.strip() or "claude"
+    ).stdout.strip()
+    if not real_claude:
+        for candidate in (
+            Path.home() / ".local/bin/claude",
+            Path("/opt/homebrew/bin/claude"),
+            Path("/usr/local/bin/claude"),
+            Path.home() / ".claude/local/claude",
+        ):
+            if candidate.exists():
+                real_claude = str(candidate)
+                break
+    if not real_claude:
+        real_claude = "claude"
 
     # Suppress per-call session JSONLs unless caller opts in. The whole point
     # of `claude -p` is one-shot, so persisted sessions clutter the VS Code
