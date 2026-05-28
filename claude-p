@@ -26,6 +26,7 @@ import json
 import os
 import socket
 import subprocess
+import platform
 import sys
 import time
 import uuid
@@ -389,6 +390,22 @@ def maybe_alert_auth_failure(machine: str, mode: str = "cli") -> None:
         )
     try:
         send_alert_email(subject=subject, body=body)
+    except Exception:
+        pass
+    # Reactive auto-fix: also kickstart the computer-use-local claude-login
+    # LaunchAgent (com.cc.claude-login-refresh). It runs the OAuth automation
+    # end-to-end on the GUI user session and refreshes ~/.claude/.credentials.json
+    # without human input. Throttled the same as the email (one per hour per
+    # machine per mode) since both are gated by the flag-file above.
+    try:
+        if platform.system() == "Darwin":
+            uid = os.getuid()
+            subprocess.run(
+                ["launchctl", "kickstart", "-k",
+                 f"gui/{uid}/com.cc.claude-login-refresh"],
+                capture_output=True,
+                timeout=5,
+            )
     except Exception:
         pass
 
