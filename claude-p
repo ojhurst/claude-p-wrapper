@@ -59,6 +59,8 @@ EXEMPT_CALLERS = {"rename.py"}
 def current_hour_key() -> str:
     return datetime.now().strftime("%Y-%m-%dT%H")
 
+AUTH_ALERT_COOLDOWN_S = 6 * 3600  # one auth-failure email per machine/mode per 6h
+
 def get_count() -> int:
     key = current_hour_key()
     try:
@@ -339,7 +341,7 @@ def is_auth_failure(stdout_bytes: bytes) -> bool:
 
 
 def maybe_alert_auth_failure(machine: str, mode: str = "cli") -> None:
-    """Send at most one auth-failure email per hour per machine per mode.
+    """Send at most one auth-failure email per machine per mode per 6h.
 
     `mode` is "cli" for the "Not logged in" JSON envelope (CLI thinks it has
     no credentials) or "api" for the server-side 401 rejection (CLI has
@@ -348,18 +350,21 @@ def maybe_alert_auth_failure(machine: str, mode: str = "cli") -> None:
     /login OR wait for a token-revocation issue to clear (rate limit,
     concurrent-session invalidation, expired refresh chain).
 
+    Cooldown is AUTH_ALERT_COOLDOWN_S (6h). Was hourly until 2026-05-28 —
+    James was getting 6+ "[claude-p] API 401" emails per overnight stretch
+    while a single token-stale incident worked itself out.
+
     Quiet on disk if alerter can't reach Resend — the stderr line is the
     user-visible signal.
     """
-    key = current_hour_key()
     flag = Path(f"/tmp/claude-p-auth-alert-{machine}-{mode}")
     try:
-        if flag.exists() and flag.read_text().strip() == key:
+        if flag.exists() and (time.time() - flag.stat().st_mtime) < AUTH_ALERT_COOLDOWN_S:
             return
     except Exception:
         pass
     try:
-        flag.write_text(key)
+        flag.touch()
     except Exception:
         pass
     if mode == "api":
