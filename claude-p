@@ -526,11 +526,13 @@ def main():
         # streamed stdout via inherit; that let "Not logged in" responses
         # leak straight to callers, which the namer then treated as a real
         # title. See RCA 2026-05-07.
+        env = {**os.environ, "CLAUDE_NONINTERACTIVE": "1"}
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=env,
         )
         stdout_buf, stderr_buf = proc.communicate(input=stdin_data)
         exit_code = proc.returncode
@@ -573,6 +575,7 @@ def main():
                         stdin=subprocess.PIPE,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
+                        env=env,
                     )
                     stdout_buf2, stderr_buf2 = retry_proc.communicate(input=stdin_data)
                     retry_exit = retry_proc.returncode
