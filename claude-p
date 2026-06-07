@@ -34,7 +34,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-WRAPPER_VERSION = 6
+WRAPPER_VERSION = 7
 LOG_TZ = ZoneInfo("America/Denver")  # Utah Mountain Time, DST-aware
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -270,6 +270,68 @@ def classify_error(exit_code: int, stderr_tail: str) -> str:
 # callers can distinguish "auth lapsed, nothing to do but /login" from a real
 # CLI crash. Most callers just check `returncode != 0` and fall through to
 # their own error path, which is the desired fail-closed behavior.
+CREDS_FILE = Path.home() / ".claude" / ".credentials.json"
+
+SDK_MODEL_MAP = {
+    "default": "claude-sonnet-4-6-20250514",
+    "sonnet": "claude-sonnet-4-6-20250514",
+    "opus": "claude-opus-4-6-20250620",
+    "haiku": "claude-haiku-4-5-20251001",
+}
+
+SDK_MAX_TOKENS = 16384
+
+
+def read_oauth_token():
+    """Read the OAuth access token from the local credentials file."""
+    try:
+        with open(CREDS_FILE) as f:
+            creds = json.load(f)
+        token = creds.get("claudeAiOauth", {}).get("accessToken", "")
+        return token if len(token) >= 50 else None
+    except Exception:
+        return None
+
+
+def try_sdk_call(prompt: str, model: str = "default", stdin_data: bytes = b""):
+    """Call the Anthropic API directly using the OAuth token.
+
+    Returns (text, None) on success, (None, reason) on failure.
+    Any failure falls through to the CLI path — this never raises.
+    """
+    try:
+        import anthropic
+    except ImportError:
+        return None, "sdk_import_failed"
+
+    token = read_oauth_token()
+    if not token:
+        return None, "no_token"
+
+    model_id = SDK_MODEL_MAP.get(model, model)
+
+    full_prompt = prompt
+    if stdin_data:
+        stdin_text = stdin_data.decode("utf-8", errors="replace")
+        full_prompt = (prompt + "\n" + stdin_text).strip() if prompt else stdin_text
+
+    if not full_prompt:
+        return None, "empty_prompt"
+
+    try:
+        client = anthropic.Anthropic(auth_token=token)
+        resp = client.messages.create(
+            model=model_id,
+            max_tokens=SDK_MAX_TOKENS,
+            messages=[{"role": "user", "content": full_prompt}],
+        )
+        text = resp.content[0].text if resp.content else ""
+        return text, None
+    except Exception as e:
+        err_type = type(e).__name__
+        return None, f"sdk_{err_type}"
+
+
 AUTH_FAILURE_EXIT = 78
 AUTH_FAILURE_MARKER = "Not logged in"
 API_AUTH_FAILURE_MARKER = "Failed to authenticate. API Error: 401"
@@ -481,6 +543,29 @@ def main():
     if count > HARD_LIMIT and caller in EXEMPT_CALLERS:
         base_entry["exempt"] = True
 
+    # ── SDK path: call Anthropic API directly with OAuth token ────────────
+    # Faster (no subprocess), avoids CLI "Not logged in" false negatives.
+    # Falls through to the CLI path on any failure.
+    if not os.environ.get("CLAUDE_P_NO_SDK"):
+        sdk_model = parse_model(args)
+        sdk_start = time.monotonic()
+        sdk_text, sdk_err = try_sdk_call(argv_prompt, model=sdk_model, stdin_data=stdin_data)
+        if sdk_text is not None:
+            sdk_elapsed = round(time.monotonic() - sdk_start, 2)
+            sys.stdout.write(sdk_text)
+            sys.stdout.flush()
+            log({
+                **base_entry,
+                "backend":        "sdk",
+                "elapsed_s":      sdk_elapsed,
+                "exit_code":      0,
+                "error_category": "ok",
+                "response_chars": len(sdk_text),
+            })
+            sys.exit(0)
+        else:
+            base_entry["sdk_fallback_reason"] = sdk_err
+
     # Find real claude binary. `which claude` works fine in an interactive
     # shell, but returns empty under launchd's stripped PATH and over
     # non-interactive SSH — both common for daemon callers like the
@@ -643,6 +728,7 @@ def main():
 
     log({
         **base_entry,
+        "backend":         "cli",
         "elapsed_s":       elapsed,
         "exit_code":       exit_code,
         "stderr_tail":     stderr_tail,
