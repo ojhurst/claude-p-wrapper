@@ -546,7 +546,13 @@ def main():
     # ── SDK path: call Anthropic API directly with OAuth token ────────────
     # Faster (no subprocess), avoids CLI "Not logged in" false negatives.
     # Falls through to the CLI path on any failure.
-    if not os.environ.get("CLAUDE_P_NO_SDK"):
+    sdk_skip = os.environ.get("CLAUDE_P_NO_SDK")
+    if not sdk_skip:
+        full_text = (preview_source or "").lower()
+        if "read tool" in full_text or "read file" in full_text or "--allowedTools" in " ".join(args):
+            sdk_skip = "tool_dependent_prompt"
+            base_entry["sdk_fallback_reason"] = sdk_skip
+    if not sdk_skip:
         sdk_model = parse_model(args)
         sdk_start = time.monotonic()
         sdk_text, sdk_err = try_sdk_call(argv_prompt, model=sdk_model, stdin_data=stdin_data)
