@@ -585,39 +585,12 @@ def main():
     if count > HARD_LIMIT and caller in EXEMPT_CALLERS:
         base_entry["exempt"] = True
 
-    # ── SDK path: call Anthropic API directly with OAuth token ────────────
-    # Faster (no subprocess), avoids CLI "Not logged in" false negatives.
-    # Falls through to the CLI path on any failure.
-    # Skipped when --image is used (SDK path is text-only; images need the
-    # CLI's Read tool for vision).
-    sdk_skip = os.environ.get("CLAUDE_P_NO_SDK")
-    if not sdk_skip and image_paths:
-        sdk_skip = "image_requires_cli"
-        base_entry["sdk_fallback_reason"] = sdk_skip
-    if not sdk_skip:
-        full_text = (preview_source or "").lower()
-        if "read tool" in full_text or "read file" in full_text or "--allowedTools" in " ".join(args):
-            sdk_skip = "tool_dependent_prompt"
-            base_entry["sdk_fallback_reason"] = sdk_skip
-    if not sdk_skip:
-        sdk_model = parse_model(args)
-        sdk_start = time.monotonic()
-        sdk_text, sdk_err = try_sdk_call(argv_prompt, model=sdk_model, stdin_data=stdin_data)
-        if sdk_text is not None:
-            sdk_elapsed = round(time.monotonic() - sdk_start, 2)
-            sys.stdout.write(sdk_text)
-            sys.stdout.flush()
-            log({
-                **base_entry,
-                "backend":        "sdk",
-                "elapsed_s":      sdk_elapsed,
-                "exit_code":      0,
-                "error_category": "ok",
-                "response_chars": len(sdk_text),
-            })
-            sys.exit(0)
-        else:
-            base_entry["sdk_fallback_reason"] = sdk_err
+    # ── SDK path: DISABLED (Build 18) ─────────────────────────────────────
+    # The SDK path (Build 15) called the Anthropic API directly but silently
+    # dropped --system-prompt and --output-format flags, breaking every caller
+    # that depends on them (session namer, screenshot renamer, etc.). Reverted
+    # to CLI-only until the SDK path properly handles all flags.
+    base_entry["sdk_fallback_reason"] = "disabled_build_18"
 
     # Find real claude binary. `which claude` works fine in an interactive
     # shell, but returns empty under launchd's stripped PATH and over
