@@ -15,6 +15,11 @@ An email is sent at most once per hour per tier to avoid flooding.
 Usage (identical to `claude -p` without the `-p` flag):
   claude-p [flags] "prompt text"
   claude-p [flags] < stdin_prompt
+  claude-p --image /path/to/img.jpg "Describe this image"
+
+Vision: pass --image (repeatable) to attach image files. The wrapper prepends
+Read instructions so the CLI's Read tool loads each image for vision analysis.
+Automatically adds --permission-mode bypassPermissions when images are present.
 
 Scripts should call this instead of `claude -p`. This wrapper prepends `-p` automatically.
 """
@@ -34,7 +39,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-WRAPPER_VERSION = 7
+WRAPPER_VERSION = 8
 LOG_TZ = ZoneInfo("America/Denver")  # Utah Mountain Time, DST-aware
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -477,8 +482,37 @@ def maybe_alert_auth_failure(machine: str, mode: str = "cli") -> None:
         pass
 
 
+def extract_images(args):
+    """Strip --image flags from args, return (cleaned_args, image_paths)."""
+    cleaned = []
+    images = []
+    skip_next = False
+    for i, a in enumerate(args):
+        if skip_next:
+            skip_next = False
+            continue
+        if a == "--image" and i + 1 < len(args):
+            images.append(args[i + 1])
+            skip_next = True
+        elif a.startswith("--image="):
+            images.append(a.split("=", 1)[1])
+        else:
+            cleaned.append(a)
+    return cleaned, images
+
+
+def build_image_preamble(image_paths):
+    """Build prompt preamble that instructs the CLI to read image files."""
+    reads = "\n".join(f"- {p}" for p in image_paths)
+    return (
+        f"First, use the Read tool to read each of these {len(image_paths)} image file(s) "
+        f"and analyze them visually:\n{reads}\n\nThen answer the following:\n"
+    )
+
+
 def main():
-    args = sys.argv[1:]
+    raw_args = sys.argv[1:]
+    args, image_paths = extract_images(raw_args)
     caller = detect_caller()
     sid = (
         os.environ.get("CLAUDE_SESSION_ID")
@@ -500,6 +534,12 @@ def main():
     stdin_data = b""
     if not sys.stdin.isatty():
         stdin_data = sys.stdin.buffer.read()
+
+    # Prepend image read instructions to stdin when --image is used
+    if image_paths:
+        preamble = build_image_preamble(image_paths).encode("utf-8")
+        stdin_data = preamble + stdin_data
+
     argv_prompt = " ".join(a for a in args if not a.startswith("-"))
     argv_chars = len(argv_prompt)
     prompt_chars = len(stdin_data) + argv_chars
@@ -535,6 +575,8 @@ def main():
         "prompt_preview": prompt_preview,
         "count_this_hour": count,
     }
+    if image_paths:
+        base_entry["image_count"] = len(image_paths)
 
     # Suppress if over hard limit — unless caller is on the event-driven allowlist
     if count > HARD_LIMIT and caller not in EXEMPT_CALLERS:
@@ -546,7 +588,12 @@ def main():
     # ── SDK path: call Anthropic API directly with OAuth token ────────────
     # Faster (no subprocess), avoids CLI "Not logged in" false negatives.
     # Falls through to the CLI path on any failure.
+    # Skipped when --image is used (SDK path is text-only; images need the
+    # CLI's Read tool for vision).
     sdk_skip = os.environ.get("CLAUDE_P_NO_SDK")
+    if not sdk_skip and image_paths:
+        sdk_skip = "image_requires_cli"
+        base_entry["sdk_fallback_reason"] = sdk_skip
     if not sdk_skip:
         full_text = (preview_source or "").lower()
         if "read tool" in full_text or "read file" in full_text or "--allowedTools" in " ".join(args):
@@ -605,6 +652,8 @@ def main():
     persist_opt_in = os.environ.get("CLAUDE_P_PERSIST", "").strip().lower() in ("1", "true", "yes")
     suppress_persistence = (not persist_opt_in) and ("--no-session-persistence" not in args)
     extra_flags = ["--no-session-persistence"] if suppress_persistence else []
+    if image_paths and "--permission-mode" not in " ".join(args):
+        extra_flags += ["--permission-mode", "bypassPermissions"]
     base_entry["persist"] = not suppress_persistence
     cmd = [real_claude, "-p"] + extra_flags + args
 
