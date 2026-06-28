@@ -639,7 +639,10 @@ def main():
         # streamed stdout via inherit; that let "Not logged in" responses
         # leak straight to callers, which the namer then treated as a real
         # title. See RCA 2026-05-07.
-        env = {**os.environ, "CLAUDE_NONINTERACTIVE": "1"}
+        # CLAUDE_P_AUTOMATION lets the interactive output-shaping hooks
+        # (timestamp banner, context bar, commit-status line, model tag) detect
+        # a headless call and skip themselves, keeping output strict for parsers.
+        env = {**os.environ, "CLAUDE_NONINTERACTIVE": "1", "CLAUDE_P_AUTOMATION": "1"}
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
