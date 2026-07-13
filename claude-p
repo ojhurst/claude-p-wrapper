@@ -288,7 +288,20 @@ SDK_MAX_TOKENS = 16384
 
 
 def read_oauth_token():
-    """Read the OAuth access token from the local credentials file."""
+    """Read the OAuth access token.
+
+    Prefers the machine-local long-lived token (~/.claude/oauth-token, from
+    `claude setup-token`) over .credentials.json, mirroring the env-var
+    precedence used for the CLI subprocess path.
+    """
+    try:
+        token_file = Path.home() / ".claude" / "oauth-token"
+        if token_file.exists():
+            lt = token_file.read_text().strip()
+            if lt.startswith("sk-ant-") and len(lt) > 80:
+                return lt
+    except Exception:
+        pass
     try:
         with open(CREDS_FILE) as f:
             creds = json.load(f)
@@ -643,6 +656,15 @@ def main():
         # (timestamp banner, context bar, commit-status line, model tag) detect
         # a headless call and skip themselves, keeping output strict for parsers.
         env = {**os.environ, "CLAUDE_NONINTERACTIVE": "1", "CLAUDE_P_AUTOMATION": "1"}
+        # Machine-local long-lived token (claude setup-token, 1-year lifetime).
+        # If ~/.claude/oauth-token exists, it wins over .credentials.json — this
+        # frees headless boxes (VPS) from the MBP keychain-harvest sync chain.
+        # Backup copy: Parameter Store /claude/vps/CLAUDE_CODE_OAUTH_TOKEN.
+        token_file = Path.home() / ".claude" / "oauth-token"
+        if "CLAUDE_CODE_OAUTH_TOKEN" not in env and token_file.exists():
+            lt = token_file.read_text().strip()
+            if lt.startswith("sk-ant-") and len(lt) > 80:
+                env["CLAUDE_CODE_OAUTH_TOKEN"] = lt
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
