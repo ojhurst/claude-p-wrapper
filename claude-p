@@ -25,6 +25,7 @@ Scripts should call this instead of `claude -p`. This wrapper prepends `-p` auto
 """
 
 import base64
+import collections
 import email.mime.text
 import hashlib
 import json
@@ -118,6 +119,136 @@ def send_alert_email(subject: str, body: str):
         except Exception:
             pass
 
+# ── Auto-diagnosis for alert emails ───────────────────────────────────────────
+# When a threshold email fires it should already carry the "what" and the "how to
+# fix," so James can act (or just say "fix it") without digging through logs.
+
+# STDERR frequently carries only a cosmetic settings.json permission warning; the
+# real failure ("User OAuth refresh failed …") lands on STDOUT. Skip the cosmetic
+# noise so it is never mistaken for the cause.
+_COSMETIC_MARKERS = ("Permission allow rule",)
+
+# needle in stdout+stderr  ->  short tag stored as error_signature
+_ERROR_SIGNATURES = (
+    ("User OAuth refresh failed",              "oauth_refresh_failed"),
+    ("OAuth token refresh failed",             "oauth_refresh_failed"),
+    ("Failed to authenticate. API Error: 401", "api_401"),
+    ("Not logged in",                          "not_logged_in"),
+    ("API Error: 429",                         "rate_limited"),
+    ("API Error: 529",                         "overloaded"),
+    ("API Error: 500",                         "api_500"),
+    ("API Error: 400",                         "api_400"),
+)
+
+_AUTH_TAGS = {"oauth_refresh_failed", "api_401", "not_logged_in",
+              "api_auth_failure", "auth_failure"}
+
+
+def extract_error_signature(stdout_bytes, stderr_bytes, exit_code) -> str:
+    """A short, human-meaningful marker for a failed call, logged as
+    `error_signature`. Scans stdout first (auth errors live there), and skips the
+    cosmetic settings.json permission warning that otherwise dominates stderr."""
+    if not exit_code:
+        return ""
+    out = (stdout_bytes or b"").decode("utf-8", errors="ignore")
+    err = (stderr_bytes or b"").decode("utf-8", errors="ignore")
+    combined = out + "\n" + err
+    for needle, tag in _ERROR_SIGNATURES:
+        if needle in combined:
+            return tag
+    for text in (out, err):
+        for line in text.splitlines():
+            line = line.strip()
+            if line and not any(c in line for c in _COSMETIC_MARKERS):
+                return line[:120]
+    return f"exit_{exit_code}"
+
+
+def diagnose_hour(caller: str) -> str:
+    """Scan this hour's usage log and return a plain-English diagnosis block
+    (one-sentence summary + likely cause + proposed fix) for the alert email.
+    Never raises — a diagnosis failure must not block the alert."""
+    try:
+        key = current_hour_key()
+        entries = []
+        if LOG_FILE.exists():
+            with open(LOG_FILE) as f:
+                for line in f:
+                    if key not in line:
+                        continue
+                    try:
+                        d = json.loads(line)
+                    except Exception:
+                        continue
+                    if str(d.get("ts", "")).startswith(key):
+                        entries.append(d)
+        total = len(entries)
+        if not total:
+            return ""
+
+        failed = [e for e in entries
+                  if e.get("exit_code") not in (0, None)
+                  or e.get("error_category") not in ("ok", None)]
+        fail_n = len(failed)
+        fail_pct = round(100 * fail_n / total)
+
+        callers = collections.Counter(e.get("caller", "?") for e in entries)
+        top_caller, top_n = callers.most_common(1)[0]
+        top_pct = round(100 * top_n / total)
+
+        auth_hit = any(
+            (e.get("error_signature") in _AUTH_TAGS)
+            or (e.get("error_category") in ("api_auth_failure", "auth_failure"))
+            for e in failed
+        )
+        top_err = next((e.get("error_signature") for e in failed
+                        if e.get("error_signature")
+                        and not str(e.get("error_signature")).startswith("exit_")), "")
+
+        machine = machine_tag()
+        out = ["── Auto-diagnosis ──"]
+        if fail_n and fail_pct >= 50:
+            out.append(
+                f"{fail_n} of the last {total} calls this hour FAILED ({fail_pct}%). "
+                f"{top_caller} drives {top_pct}% of the volume by retrying on failure."
+            )
+            if auth_hit:
+                out.append(
+                    "Likely cause: headless auth is down — the OAuth token expired and its "
+                    "refresh is being rejected (a login on another machine can revoke the "
+                    "shared token chain). Every claude -p call fails until re-login; timer "
+                    "callers then retry in a loop and inflate the count."
+                )
+                out.append(
+                    f"Proposed fix: run  claude /login  on {machine}, then  "
+                    f"bash ~/apps/cc/recipes/claude-creds-publish.sh  to refresh Parameter "
+                    f"Store for every machine. (Any 'Write(...settings.json)' line in stderr "
+                    f"is a cosmetic permission warning — not the cause.)"
+                )
+            else:
+                out.append(f"Likely cause: {top_caller} is erroring and retrying.")
+                out.append(
+                    "Proposed fix: fix the underlying error for that caller; until then it "
+                    "keeps retrying. Breakdown: python3 ~/apps/claude-p-wrapper/claude-p-report --hours 1"
+                )
+        else:
+            out.append(
+                f"{top_caller} generated {top_pct}% of {total} calls this hour "
+                f"({fail_n} failed) — a busy or looping caller, not an outage."
+            )
+            out.append(
+                "Proposed fix: check that caller's cadence. "
+                "Breakdown: python3 ~/apps/claude-p-wrapper/claude-p-report --hours 1"
+            )
+        if top_err:
+            out.append(f"Top error: {top_err}")
+        out.append("Callers this hour: "
+                   + ", ".join(f"{c}={n}" for c, n in callers.most_common(5)))
+        return "\n".join(out) + "\n"
+    except Exception as e:
+        return f"(auto-diagnosis unavailable: {e})\n"
+
+
 def maybe_alert(count: int, caller: str):
     """Send an email alert if we just crossed a threshold — at most once per hour per tier."""
     key = current_hour_key()
@@ -162,6 +293,10 @@ def maybe_alert(count: int, caller: str):
             f"Run: python3 ~/apps/claude-p-wrapper/claude-p-report --hours 1\n"
             f"to see the full breakdown."
         )
+
+    diag = diagnose_hour(caller)
+    if diag:
+        body = body + "\n" + diag
 
     send_alert_email(subject, body)
 
@@ -353,6 +488,17 @@ def try_sdk_call(prompt: str, model: str = "default", stdin_data: bytes = b""):
 AUTH_FAILURE_EXIT = 78
 AUTH_FAILURE_MARKER = "Not logged in"
 API_AUTH_FAILURE_MARKER = "Failed to authenticate. API Error: 401"
+# Additional server-side auth-rejection shapes. 2026-07-16: a login on another
+# machine revoked the shared OAuth refresh chain, so every headless call began
+# printing "API Error: User OAuth refresh failed (HTTP 400)" to stdout and
+# exiting non-zero. The 401-only marker missed it, so auto-recovery never fired
+# and no auth alert went out — the sole signal was the 100/hour volume alarm
+# once meal-tracker's scan.py retried enough to trip it. Broaden the net.
+API_AUTH_FAILURE_MARKERS = (
+    API_AUTH_FAILURE_MARKER,
+    "User OAuth refresh failed",
+    "OAuth token refresh failed",
+)
 
 
 def is_api_auth_failure(stdout_bytes: bytes, stderr_bytes: bytes) -> bool:
@@ -373,7 +519,7 @@ def is_api_auth_failure(stdout_bytes: bytes, stderr_bytes: bytes) -> bool:
         if not buf:
             continue
         text = buf.decode("utf-8", errors="ignore")
-        if API_AUTH_FAILURE_MARKER in text:
+        if any(m in text for m in API_AUTH_FAILURE_MARKERS):
             return True
     return False
 
@@ -779,14 +925,18 @@ def main():
         else classify_error(exit_code, stderr_tail)
     )
 
-    log({
+    entry = {
         **base_entry,
         "backend":         "cli",
         "elapsed_s":       elapsed,
         "exit_code":       exit_code,
         "stderr_tail":     stderr_tail,
         "error_category":  error_category,
-    })
+    }
+    error_signature = extract_error_signature(stdout_buf, stderr_buf, exit_code)
+    if error_signature:
+        entry["error_signature"] = error_signature
+    log(entry)
     sys.exit(exit_code)
 
 
