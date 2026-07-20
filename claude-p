@@ -498,6 +498,14 @@ API_AUTH_FAILURE_MARKERS = (
     API_AUTH_FAILURE_MARKER,
     "User OAuth refresh failed",
     "OAuth token refresh failed",
+    # 2026-07-20: the OAuth token expired (July 14) and its refresh chain went
+    # dead, so the CLI began returning is_error:true with this exact wording.
+    # None of the markers above matched, so the wrapper passed it through as a
+    # legitimate `result` — and the session-namer wrote it as tab titles
+    # ("Failed to authenticate: OAuth session"). Match the stable substring so
+    # this shape is suppressed, triggers recovery, and alerts like the others.
+    "OAuth session expired and could not be refreshed",
+    "Failed to authenticate: OAuth session",
 )
 
 
