@@ -40,7 +40,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-WRAPPER_VERSION = 8
+WRAPPER_VERSION = 9
 LOG_TZ = ZoneInfo("America/Denver")  # Utah Mountain Time, DST-aware
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -574,22 +574,188 @@ def is_auth_failure(stdout_bytes: bytes) -> bool:
     return True
 
 
-def maybe_alert_auth_failure(machine: str, mode: str = "cli") -> None:
-    """Send at most one auth-failure email per machine per mode per 6h.
+# ── Fallback brain: serve callers when OAuth is down ───────────────────────────
+# The Anthropic API key (/anthropic/api-key) is a SEPARATE credential that
+# survives an OAuth outage. When `claude -p` auth fails, we answer the caller
+# through claude-login's brain via that key instead of going dark. Honors
+# --system-prompt / --append-system-prompt and --output-format json so callers
+# that depend on those flags keep working — the exact gap that got the old SDK
+# path disabled in Build 18.
 
-    `mode` is "cli" for the "Not logged in" JSON envelope (CLI thinks it has
-    no credentials) or "api" for the server-side 401 rejection (CLI has
-    credentials, API rejected them). They are tracked separately because
-    they have different fixes: cli mode = /login on the machine. api mode =
-    /login OR wait for a token-revocation issue to clear (rate limit,
-    concurrent-session invalidation, expired refresh chain).
+CLAUDE_LOGIN_DIR = Path.home() / "apps" / "claude-login"
+GRACE_MIN = 15  # hold auth alerts until an outage is sustained this long
 
-    Cooldown is AUTH_ALERT_COOLDOWN_S (6h). Was hourly until 2026-05-28 —
-    James was getting 6+ "[claude-p] API 401" emails per overnight stretch
-    while a single token-stale incident worked itself out.
 
-    Quiet on disk if alerter can't reach Resend — the stderr line is the
-    user-visible signal.
+def map_model_to_api(model_name: str) -> str:
+    """Map a caller's model name to a current, valid Anthropic API model id.
+    brain.py's own DEFAULT_MODEL ("claude-sonnet-4-6") is stale; pin live ids."""
+    m = (model_name or "").lower()
+    if "haiku" in m:  return "claude-haiku-4-5-20251001"
+    if "opus" in m:   return "claude-opus-4-8"
+    if "sonnet" in m: return "claude-sonnet-5"
+    return "claude-sonnet-5"  # "default"/unknown — matches claude -p's default tier
+
+
+def _flag_value(args, name: str):
+    """Return the value of `--name val` or `--name=val` from args, else None."""
+    for i, a in enumerate(args):
+        if a == name and i + 1 < len(args):
+            return args[i + 1]
+        if a.startswith(name + "="):
+            return a.split("=", 1)[1]
+    return None
+
+
+def brain_serve(args, stdin_data: bytes, model_name: str):
+    """Answer the current caller via the API-key brain. Returns stdout bytes to
+    emit (plain text, or a CLI-shaped JSON envelope when --output-format json),
+    or None if the brain is unavailable or the request can't be safely served."""
+    out_fmt = (_flag_value(args, "--output-format") or "").lower()
+    if out_fmt not in ("", "text", "json"):
+        return None  # stream-json etc. — don't risk a malformed degrade
+    try:
+        if str(CLAUDE_LOGIN_DIR) not in sys.path:
+            sys.path.insert(0, str(CLAUDE_LOGIN_DIR))
+        from claude_login import brain
+    except Exception:
+        return None
+    if not brain.available():
+        return None
+    argv_prompt = " ".join(a for a in args if not a.startswith("-"))
+    full = argv_prompt
+    if stdin_data:
+        st = stdin_data.decode("utf-8", errors="replace")
+        full = (argv_prompt + "\n" + st).strip() if argv_prompt else st
+    if not full.strip():
+        return None
+    system = _flag_value(args, "--system-prompt") or _flag_value(args, "--append-system-prompt")
+    try:
+        text = brain.ask(full, system=system, model=map_model_to_api(model_name),
+                         max_tokens=8192, timeout=90)
+    except Exception:
+        return None
+    if not text:
+        return None
+    if out_fmt == "json":
+        envelope = {
+            "type": "result", "subtype": "success", "is_error": False,
+            "result": text, "session_id": "brain-fallback", "num_turns": 1,
+            "total_cost_usd": 0, "brain_fallback": True,
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        }
+        return (json.dumps(envelope) + "\n").encode()
+    return (text.rstrip("\n") + "\n").encode()
+
+
+# ── Auth-failure escalation: grace-gated, PONG-verified, smart receipt ─────────
+
+def auth_outage_minutes() -> float:
+    """Minutes since the current unbroken auth-outage streak began, from the
+    usage log. 0.0 when this is the first failure (nothing to page on yet)."""
+    try:
+        if not LOG_FILE.exists():
+            return 0.0
+        with LOG_FILE.open() as f:
+            lines = f.readlines()[-200:]
+        down = {"auth_failure", "api_auth_failure", "brain_fallback"}
+        streak_start = None
+        for line in reversed(lines):
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            if d.get("error_category") in down:
+                streak_start = d.get("ts")
+                continue
+            break
+        if not streak_start:
+            return 0.0
+        start = datetime.fromisoformat(streak_start)
+        return max(0.0, (datetime.now(LOG_TZ) - start).total_seconds() / 60.0)
+    except Exception:
+        return 0.0
+
+
+def _pong_reverify() -> bool:
+    """Fresh live check: does `claude -p` authenticate right now? Runs the wrapper
+    in inner mode (no recovery/serve/escalate) so it can't recurse."""
+    try:
+        env = {**os.environ, "CLAUDE_P_INNER": "1"}
+        p = subprocess.run(
+            [str(Path(__file__).resolve()), "say PONG", "--model", "haiku"],
+            capture_output=True, text=True, timeout=45, env=env,
+        )
+        return p.returncode == 0
+    except Exception:
+        return False
+
+
+def _kickstart_login_agent() -> None:
+    """Fire the async browser-login heal in the GUI session (macOS only)."""
+    try:
+        if platform.system() == "Darwin":
+            uid = os.getuid()
+            subprocess.run(
+                ["launchctl", "kickstart", "-k",
+                 f"gui/{uid}/com.cc.claude-login-refresh"],
+                capture_output=True, timeout=5,
+            )
+    except Exception:
+        pass
+
+
+def _escalate_claude_login(machine: str, mode: str) -> bool:
+    """Run claude-login's non-browser heal ladder and email the SMART receipt if
+    it still can't fix it. Returns True if claude-login handled it (healed or
+    emailed), False if claude-login is unavailable (caller should backstop)."""
+    try:
+        if str(CLAUDE_LOGIN_DIR) not in sys.path:
+            sys.path.insert(0, str(CLAUDE_LOGIN_DIR))
+        import claude_login
+    except Exception:
+        return False
+    os.environ["CLAUDE_P_INNER"] = "1"  # guard any nested claude-p the ladder runs
+    trigger = (
+        f"`claude -p` on {machine} hit "
+        + ("the 'Not logged in' envelope" if mode == "cli"
+           else "a server-side 401 / dead refresh chain")
+        + f", sustained past the {GRACE_MIN}m grace window. The API-key brain is "
+          "serving callers in degraded mode; the OAuth login still needs a durable fix."
+    )
+    try:
+        claude_login.heal("claude-cli", trigger=trigger,
+                          allow_browser=False, email_on_fail=True)
+        return True
+    except Exception as e:
+        sys.stderr.write(f"[claude-p] claude-login escalation error: {e}\n")
+        return False
+
+
+def _legacy_terse_email(machine: str, mode: str) -> None:
+    """Backstop ONLY when claude-login is unavailable — never go silent."""
+    if mode == "api":
+        subject = f"[claude-p] API 401 on {machine} — token rejected"
+        body = (f"`claude -p` on {machine} is hitting HTTP 401 and claude-login is "
+                f"not reachable to send a full receipt.\n\n"
+                "Fix: open Terminal on that machine and run:\n  claude /login\n")
+    else:
+        subject = f"[claude-p] auth lapsed on {machine}"
+        body = (f"`claude -p` on {machine} is returning 'Not logged in' and "
+                f"claude-login is not reachable to send a full receipt.\n\n"
+                "Fix: open Terminal on that machine and run:\n  claude /login\n")
+    try:
+        send_alert_email(subject=subject, body=body)
+    except Exception:
+        pass
+
+
+def handle_auth_failure(machine: str, mode: str) -> None:
+    """Decide whether to page James, and do it the smart way.
+
+    Grace-gated (no page for transient blips that self-heal), PONG-verified (a
+    live re-check right before paging, so a just-healed token suppresses the
+    alert), and routed through claude-login's receipt (what-it-tried, brain-
+    sharpened) instead of a terse guess. One escalation per machine/mode per 6h.
     """
     flag = Path(f"/tmp/claude-p-auth-alert-{machine}-{mode}")
     try:
@@ -597,56 +763,27 @@ def maybe_alert_auth_failure(machine: str, mode: str = "cli") -> None:
             return
     except Exception:
         pass
-    try:
-        flag.touch()
-    except Exception:
-        pass
-    if mode == "api":
-        subject = f"[claude-p] API 401 on {machine} — token rejected"
-        body = (
-            f"`claude -p` on {machine} is hitting HTTP 401 from the API:\n"
-            f'    Failed to authenticate. API Error: 401 Invalid authentication credentials\n\n'
-            "The CLI has credentials but the server is rejecting them. "
-            "Common causes: token revoked by a concurrent login on another "
-            "machine, rate-limit-driven invalidation, or a refresh token "
-            "that lost its chain.\n\n"
-            "Fix: open Terminal on that machine and run:\n"
-            "  claude /login\n\n"
-            "Until then, every claude-p call from that machine is exiting "
-            "with code 78 (api_auth_failure).\n"
+
+    outage = auth_outage_minutes()
+    if outage < GRACE_MIN:
+        sys.stderr.write(
+            f"[claude-p] auth failing ~{outage:.0f}m (<{GRACE_MIN}m grace) — holding "
+            f"alert; brain is serving callers. Will page only if it stays down.\n"
         )
-    else:
-        subject = f"[claude-p] auth lapsed on {machine}"
-        body = (
-            f"`claude -p` on {machine} is returning is_error:true with "
-            f'result="Not logged in · Please run /login".\n\n'
-            "Open Terminal on that machine and run:\n"
-            "  claude /login\n\n"
-            "Until then, every claude-p call from that machine is "
-            "exiting with code 78 (auth_failure). Any caller that "
-            "ignored exit codes and consumed `result` would have "
-            "captured the 'Not logged in' string as a result.\n"
-        )
-    try:
-        send_alert_email(subject=subject, body=body)
-    except Exception:
-        pass
-    # Reactive auto-fix: also kickstart the computer-use-local claude-login
-    # LaunchAgent (com.cc.claude-login-refresh). It runs the OAuth automation
-    # end-to-end on the GUI user session and refreshes ~/.claude/.credentials.json
-    # without human input. Throttled the same as the email (one per hour per
-    # machine per mode) since both are gated by the flag-file above.
-    try:
-        if platform.system() == "Darwin":
-            uid = os.getuid()
-            subprocess.run(
-                ["launchctl", "kickstart", "-k",
-                 f"gui/{uid}/com.cc.claude-login-refresh"],
-                capture_output=True,
-                timeout=5,
-            )
-    except Exception:
-        pass
+        return
+
+    if _pong_reverify():
+        sys.stderr.write("[claude-p] PONG re-verify passed — auth recovered, no alert.\n")
+        try:
+            flag.unlink()
+        except Exception:
+            pass
+        return
+
+    flag.touch()
+    if not _escalate_claude_login(machine, mode):
+        _legacy_terse_email(machine, mode)
+    _kickstart_login_agent()
 
 
 def extract_images(args):
@@ -845,9 +982,15 @@ def main():
     # Auto-recovery: if auth failed, pull fresh credentials from Parameter Store
     # and retry the call once. Skipped if CLAUDE_P_NO_RECOVER=1 (used by tests
     # that need to observe the raw auth-failure path).
+    # Inner mode: a nested claude-p spawned by the recovery/escalation path
+    # itself (PONG re-verify, claude-login's heal ladder). It must behave like
+    # plain `claude -p` — no recovery, no brain-serve, no escalation — or it
+    # would recurse. The outer process sets CLAUDE_P_INNER before spawning.
+    inner = bool(os.environ.get("CLAUDE_P_INNER"))
+
     recovery_attempted = False
     recovery_succeeded = False
-    if (auth_failed or api_auth_failed) and not os.environ.get("CLAUDE_P_NO_RECOVER"):
+    if (auth_failed or api_auth_failed) and not inner and not os.environ.get("CLAUDE_P_NO_RECOVER"):
         pull_script = Path.home() / "apps" / "cc" / "recipes" / "claude-creds-pull.sh"
         if pull_script.exists():
             recovery_attempted = True
@@ -888,34 +1031,49 @@ def main():
     base_entry["recovery_attempted"] = recovery_attempted
     base_entry["recovery_succeeded"] = recovery_succeeded
 
-    if auth_failed:
+    # Fallback brain: if OAuth is still down, serve THIS caller via the API-key
+    # brain (a credential that survives the outage) so it gets a real answer
+    # instead of a failure. Skipped in inner mode to prevent recursion.
+    served_by_brain = False
+    brain_out = None
+    if (auth_failed or api_auth_failed) and not inner:
+        try:
+            brain_out = brain_serve(args, stdin_data, parse_model(args))
+        except Exception:
+            brain_out = None
+        served_by_brain = brain_out is not None
+    base_entry["brain_fallback"] = served_by_brain
+
+    if auth_failed or api_auth_failed:
         machine = machine_tag()
-        sys.stderr.write(
-            f"[claude-p] auth lapsed on {machine} — `claude -p` returned "
-            f'is_error:true with result="Not logged in · Please run '
-            f"/login\". Suppressing stdout and exiting {AUTH_FAILURE_EXIT}.\n"
-            f"[claude-p] Fix: open Terminal on {machine} and run `claude "
-            f"/login` to refresh the keychain credential.\n"
-        )
+        mode = "cli" if auth_failed else "api"
+        if served_by_brain:
+            # Degraded mode: real answer via the API-key brain, exit clean.
+            sys.stdout.buffer.write(brain_out)
+            sys.stdout.flush()
+            sys.stderr.write(
+                f"[claude-p] OAuth down on {machine} — served this call via the "
+                f"API-key brain (degraded mode). The login still needs a durable fix.\n"
+            )
+            exit_code = 0
+        else:
+            # No brain available — fail closed so callers don't consume the
+            # auth-error string as a result.
+            sys.stderr.write(
+                f"[claude-p] {'auth lapsed' if auth_failed else 'API 401'} on "
+                f"{machine} — suppressing stdout and exiting {AUTH_FAILURE_EXIT} "
+                f"(brain fallback unavailable). Fix: run `claude /login`.\n"
+            )
+            exit_code = AUTH_FAILURE_EXIT
         sys.stderr.flush()
-        maybe_alert_auth_failure(machine, mode="cli")
-        exit_code = AUTH_FAILURE_EXIT
-    elif api_auth_failed:
-        machine = machine_tag()
-        sys.stderr.write(
-            f"[claude-p] API 401 on {machine} — server rejected the token "
-            f"with `Failed to authenticate. API Error: 401`. Suppressing "
-            f"stdout and exiting {AUTH_FAILURE_EXIT}.\n"
-            f"[claude-p] Fix: open Terminal on {machine} and run `claude "
-            f"/login` to mint a fresh OAuth token.\n"
-        )
-        sys.stderr.flush()
-        maybe_alert_auth_failure(machine, mode="api")
-        exit_code = AUTH_FAILURE_EXIT
+        if not inner:
+            # Grace-gated, PONG-verified, smart-receipt escalation.
+            try:
+                handle_auth_failure(machine, mode)
+            except Exception as e:
+                sys.stderr.write(f"[claude-p] escalation error: {e}\n")
     else:
         # Forward stdout unchanged so callers keep getting claude's output.
-        # auth_failed / api_auth_failed cases above intentionally drop stdout
-        # to prevent callers from consuming the auth-error string as a result.
         if stdout_buf:
             sys.stdout.buffer.write(stdout_buf)
             sys.stdout.flush()
@@ -928,7 +1086,8 @@ def main():
     elapsed = round(time.monotonic() - start, 2)
     stderr_tail = stderr_buf.decode(errors="replace")[-400:]
     error_category = (
-        "auth_failure" if auth_failed
+        "brain_fallback" if served_by_brain
+        else "auth_failure" if auth_failed
         else "api_auth_failure" if api_auth_failed
         else classify_error(exit_code, stderr_tail)
     )
