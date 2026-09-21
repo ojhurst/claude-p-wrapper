@@ -33,6 +33,7 @@ import os
 import socket
 import subprocess
 import platform
+import threading
 import sys
 import time
 import uuid
@@ -485,6 +486,9 @@ def try_sdk_call(prompt: str, model: str = "default", stdin_data: bytes = b""):
         return None, f"sdk_{err_type}"
 
 
+# How much stdout to hold before trusting a run is real work rather than
+# an auth-failure envelope. Both failure shapes are a few hundred bytes.
+STREAM_GATE_BYTES = 8192
 AUTH_FAILURE_EXIT = 78
 AUTH_FAILURE_MARKER = "Not logged in"
 API_AUTH_FAILURE_MARKER = "Failed to authenticate. API Error: 401"
@@ -932,11 +936,31 @@ def main():
     if image_paths and "--permission-mode" not in " ".join(args):
         extra_flags += ["--permission-mode", "bypassPermissions"]
     base_entry["persist"] = not suppress_persistence
+    # STREAMING MODE — opt in with CLAUDE_P_STREAM=1 or --stream.
+    #
+    # Default stays batch. The buffering below is not an oversight, it is the
+    # fix from RCA 2026-05-07: output used to stream through by inheritance,
+    # which let a "Not logged in" response reach the session namer as though it
+    # were a real title. Anything that streams has to keep that guarantee.
+    #
+    # It does, by holding the first STREAM_GATE_BYTES back. Both auth-failure
+    # shapes are tiny and arrive immediately — the CLI fails before it does any
+    # model work — so a run that gets past the gate cannot be one of them, and
+    # a run that ends under the gate is checked exactly as it is today.
+    stream_mode = os.environ.get("CLAUDE_P_STREAM", "").strip().lower() in ("1", "true", "yes")
+    if "--stream" in args:
+        stream_mode = True
+        args = [a for a in args if a != "--stream"]
+
     cmd = [real_claude, "-p"] + extra_flags + args
 
     start = time.monotonic()
     stderr_buf = b""
     stdout_buf = b""
+    # True once bytes have actually left for the caller. After that the
+    # suppression below can no longer un-send them, so it falls back to the
+    # exit code, which every caller that fails closed already honours.
+    streamed = False
     try:
         # Capture stdout AND stderr so we can detect the auth-failure JSON
         # shape (exit 0 + is_error:true) before forwarding. Pre-Build 7 we
@@ -963,8 +987,55 @@ def main():
             stderr=subprocess.PIPE,
             env=env,
         )
-        stdout_buf, stderr_buf = proc.communicate(input=stdin_data)
-        exit_code = proc.returncode
+        if not stream_mode:
+            stdout_buf, stderr_buf = proc.communicate(input=stdin_data)
+        else:
+            # stderr on its own thread. It is small, and reading both pipes
+            # from one thread is the classic way to deadlock on a full buffer.
+            err_chunks = []
+            def drain_stderr():
+                try:
+                    for chunk in iter(lambda: proc.stderr.read(4096), b""):
+                        err_chunks.append(chunk)
+                except Exception:
+                    pass
+            t = threading.Thread(target=drain_stderr, daemon=True)
+            t.start()
+
+            try:
+                if stdin_data:
+                    proc.stdin.write(stdin_data)
+                proc.stdin.close()
+            except Exception:
+                pass
+
+            held = bytearray()
+            out_chunks = []
+            # readline, not `for line in proc.stdout` — iterating a pipe adds a
+            # read-ahead buffer that would undo the whole point of this branch.
+            for line in iter(proc.stdout.readline, b""):
+                out_chunks.append(line)
+                if streamed:
+                    sys.stdout.buffer.write(line)
+                    sys.stdout.flush()
+                    continue
+                held += line
+                if len(held) >= STREAM_GATE_BYTES:
+                    # Past the gate: too big to be an auth envelope. Release.
+                    sys.stdout.buffer.write(bytes(held))
+                    sys.stdout.flush()
+                    held = bytearray()
+                    streamed = True
+            stdout_buf = b"".join(out_chunks)
+            t.join(timeout=5)
+            stderr_buf = b"".join(err_chunks)
+            # Ended under the gate — nothing has been sent, so the checks below
+            # still get their veto, exactly as in batch mode.
+            if not streamed and held:
+                pending_stdout = bytes(held)
+            else:
+                pending_stdout = b""
+        exit_code = proc.returncode if proc.returncode is not None else proc.wait()
     except Exception as e:
         exit_code = 1
         stderr_buf = f"[claude-p] error: {e}".encode()
@@ -1074,8 +1145,12 @@ def main():
                 sys.stderr.write(f"[claude-p] escalation error: {e}\n")
     else:
         # Forward stdout unchanged so callers keep getting claude's output.
-        if stdout_buf:
-            sys.stdout.buffer.write(stdout_buf)
+        # In streaming mode everything past the gate already went out; only the
+        # held-back remainder of a short run is still owed.
+        remaining = stdout_buf if not stream_mode else (
+            b"" if streamed else locals().get("pending_stdout", stdout_buf))
+        if remaining:
+            sys.stdout.buffer.write(remaining)
             sys.stdout.flush()
 
     # Forward stderr to our stderr so callers that grep it still see it
