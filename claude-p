@@ -980,6 +980,18 @@ def main():
             lt = token_file.read_text().strip()
             if lt.startswith("sk-ant-") and len(lt) > 80:
                 env["CLAUDE_CODE_OAUTH_TOKEN"] = lt
+        # macOS: the bare CLI reads the Keychain login, not .credentials.json. After a
+        # claude-account switch to a fleet-login account (e.g. nick) the Keychain still
+        # holds the old login, whose refresh fails (HTTP 400). Hand the CLI the fresh
+        # fleet access token from .credentials.json instead (VPS stays the sole refresher;
+        # claude-creds-pull.sh keeps the file fresh). Empty env = "skip oauth-token file".
+        if sys.platform == "darwin" and not env.get("CLAUDE_CODE_OAUTH_TOKEN"):
+            try:
+                _o = json.load(open(CREDS_FILE)).get("claudeAiOauth", {})
+                if len(_o.get("accessToken", "")) >= 50 and _o.get("expiresAt", 0) > (time.time() + 300) * 1000:
+                    env["CLAUDE_CODE_OAUTH_TOKEN"] = _o["accessToken"]
+            except Exception:
+                pass
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
