@@ -423,6 +423,37 @@ SDK_MODEL_MAP = {
 SDK_MAX_TOKENS = 16384
 
 
+def _fleet_access_token(min_secs=600):
+    """Fresh access token for the CLI on macOS: ~/.claude/oauth-token (setup-token) if
+    present, else .credentials.json's accessToken, pulling from Parameter Store when it
+    has < min_secs left. Never refreshes OAuth itself. Returns None if nothing usable."""
+    try:
+        tf = Path.home() / ".claude" / "oauth-token"
+        if tf.exists():
+            lt = tf.read_text().strip()
+            if lt.startswith("sk-ant-") and len(lt) > 80:
+                return lt
+    except Exception:
+        pass
+    def _read():
+        try:
+            o = json.load(open(CREDS_FILE)).get("claudeAiOauth", {})
+            if len(o.get("accessToken", "")) >= 50:
+                return o["accessToken"], o.get("expiresAt", 0) / 1000 - time.time()
+        except Exception:
+            pass
+        return None, -1
+    tok, left = _read()
+    if left < min_secs:
+        pull = Path.home() / "apps" / "cc" / "recipes" / "claude-creds-pull.sh"
+        try:
+            subprocess.run(["bash", str(pull)], capture_output=True, timeout=30)
+        except Exception:
+            pass
+        tok, left = _read()
+    return tok if tok and left > 60 else None
+
+
 def read_oauth_token():
     """Read the OAuth access token.
 
@@ -983,15 +1014,16 @@ def main():
         # macOS: the bare CLI reads the Keychain login, not .credentials.json. After a
         # claude-account switch to a fleet-login account (e.g. nick) the Keychain still
         # holds the old login, whose refresh fails (HTTP 400). Hand the CLI the fresh
-        # fleet access token from .credentials.json instead (VPS stays the sole refresher;
-        # claude-creds-pull.sh keeps the file fresh). Empty env = "skip oauth-token file".
-        if sys.platform == "darwin" and not env.get("CLAUDE_CODE_OAUTH_TOKEN"):
-            try:
-                _o = json.load(open(CREDS_FILE)).get("claudeAiOauth", {})
-                if len(_o.get("accessToken", "")) >= 50 and _o.get("expiresAt", 0) > (time.time() + 300) * 1000:
-                    env["CLAUDE_CODE_OAUTH_TOKEN"] = _o["accessToken"]
-            except Exception:
-                pass
+        # fleet access token instead (pulling from Parameter Store first if the local copy
+        # is stale; VPS stays the sole refresher). Also override a token inherited from
+        # `launchctl setenv` (claude-launchd-env), which can be older than the file.
+        _injected = False
+        if sys.platform == "darwin" and (not env.get("CLAUDE_CODE_OAUTH_TOKEN")
+                                         or env.get("CLAUDE_CODE_OAUTH_TOKEN_SOURCE") == "launchd-env"):
+            _lt = _fleet_access_token()
+            if _lt:
+                env["CLAUDE_CODE_OAUTH_TOKEN"] = _lt
+                _injected = True
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -1088,6 +1120,10 @@ def main():
                         "Parameter Store, retrying once.\n"
                     )
                     sys.stderr.flush()
+                    if sys.platform == "darwin" and (locals().get("_injected") or not env.get("CLAUDE_CODE_OAUTH_TOKEN")):
+                        _lt = _fleet_access_token()
+                        if _lt:
+                            env["CLAUDE_CODE_OAUTH_TOKEN"] = _lt
                     retry_proc = subprocess.Popen(
                         cmd,
                         stdin=subprocess.PIPE,
