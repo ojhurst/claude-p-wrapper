@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Claude-p Callers</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Condensed:wght@500;600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: an audit ledger. Summary strip, then one table per machine, rows sorted by call volume. */
+:root{
+  --bg:#f5f6f8; --surface:#ffffff; --fg:#1b2230; --muted:#5b6578; --line:#dde1e8;
+  --accent:#b8620b; --accent-soft:#fbefe1;
+  --opus:#7a2e8f; --opus-soft:#f4e8f7; --sonnet:#1f5fa8; --sonnet-soft:#e6eef8; --haiku:#2f7a4b; --haiku-soft:#e5f3ea;
+  --warn:#a3361f; --warn-soft:#fbe9e5;
+  --f-display:"IBM Plex Sans Condensed","Arial Narrow",system-ui,sans-serif;
+  --f-body:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --f-mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --bg:#12161d; --surface:#1a1f28; --fg:#e6e9ef; --muted:#9aa3b3; --line:#2c3340;
+  --accent:#f0a24a; --accent-soft:#3a2a16;
+  --opus:#d39be3; --opus-soft:#33213a; --sonnet:#8db8ec; --sonnet-soft:#1d2b3d; --haiku:#8fd3a6; --haiku-soft:#1c3226;
+  --warn:#f29a85; --warn-soft:#3b211b; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#12161d; --surface:#1a1f28; --fg:#e6e9ef; --muted:#9aa3b3; --line:#2c3340;
+  --accent:#f0a24a; --accent-soft:#3a2a16;
+  --opus:#d39be3; --opus-soft:#33213a; --sonnet:#8db8ec; --sonnet-soft:#1d2b3d; --haiku:#8fd3a6; --haiku-soft:#1c3226;
+  --warn:#f29a85; --warn-soft:#3b211b; color-scheme:dark}
+body{background:var(--bg);color:var(--fg);font-family:var(--f-body);font-size:15px;line-height:1.5}
+.wrap{max-width:1180px;margin:0 auto;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));padding-block:32px 64px;display:grid;gap:36px}
+h1,h2,h3{font-family:var(--f-display);text-wrap:balance;margin:0;letter-spacing:.005em}
+h1{font-size:2.1rem;font-weight:600}
+h2{font-size:1.35rem;font-weight:600}
+h3{font-size:1.05rem;font-weight:600}
+p{margin:0;max-width:68ch}
+.eyebrow{font-family:var(--f-mono);font-size:.75rem;text-transform:uppercase;letter-spacing:.08em;color:var(--accent)}
+.lede{color:var(--muted);font-size:1.02rem}
+header{display:grid;gap:10px}
+.strip{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}
+.stat{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:14px 16px;display:grid;gap:2px}
+.stat b{font-family:var(--f-display);font-size:1.7rem;font-variant-numeric:tabular-nums;font-weight:600}
+.stat span{color:var(--muted);font-size:.85rem}
+.notes{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px}
+.note{border-top:3px solid var(--line);padding-top:12px;display:grid;gap:8px;min-width:0;align-content:start}
+.note.good{border-color:var(--haiku)} .note.gap{border-color:var(--warn)} .note.watch{border-color:var(--accent)}
+.note ul{margin:0;padding-left:18px;display:grid;gap:4px}
+.tools{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+.tools input{font:inherit;padding:8px 12px;border:1px solid var(--line);border-radius:6px;background:var(--surface);color:var(--fg);min-width:0;flex:1 1 240px;max-width:420px}
+.tools input:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.legend{display:flex;gap:8px;flex-wrap:wrap;color:var(--muted);font-size:.85rem;align-items:center}
+section.machine{display:grid;gap:12px}
+.mhead{display:flex;flex-wrap:wrap;gap:6px 16px;align-items:baseline}
+.mhead .meta{color:var(--muted);font-size:.9rem}
+.tablebox{overflow-x:auto;background:var(--surface);border:1px solid var(--line);border-radius:8px}
+table{border-collapse:collapse;width:100%;min-width:880px}
+table.narrow{min-width:0}
+th,td{text-align:left;vertical-align:top;padding:10px 12px;border-bottom:1px solid var(--line)}
+th{font-family:var(--f-mono);font-size:.72rem;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:500;background:var(--bg)}
+tr:last-child td{border-bottom:0}
+td.n{font-family:var(--f-mono);font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap}
+th.n{text-align:right}
+td.when{font-family:var(--f-mono);font-size:.82rem;white-space:nowrap;color:var(--muted)}
+.svc{font-weight:600}
+.why{color:var(--muted);font-size:.88rem;display:block;margin-top:2px}
+code{font-family:var(--f-mono);font-size:.8rem;color:var(--muted);word-break:break-word}
+.pill{display:inline-block;font-family:var(--f-mono);font-size:.72rem;padding:1px 7px;border-radius:999px;white-space:nowrap;margin:0 4px 3px 0}
+.opus{background:var(--opus-soft);color:var(--opus)} .sonnet{background:var(--sonnet-soft);color:var(--sonnet)} .haiku{background:var(--haiku-soft);color:var(--haiku)}
+.flag{background:var(--warn-soft);color:var(--warn)} .trig{background:var(--accent-soft);color:var(--accent)}
+.empty{color:var(--muted)}
+footer{color:var(--muted);font-size:.85rem;display:grid;gap:6px}
+@media (max-width:520px){h1{font-size:1.7rem}}
+body{margin:0}
+[hidden]{display:none!important}
+img{max-width:100%}
+</style>
+</head>
+<body>
+
+<div class="wrap">
+<header>
+  <div class="eyebrow">Audit · Sep 20 – Oct 20, 2026 · from the claude-p usage logs</div>
+  <h1>Everything that calls Claude on its own</h1>
+  <p class="lede">Every script, service and website that ran Claude through the claude-p wrapper in the last 30 days, grouped by machine. Each row comes from the wrapper's call log: who called, from where, which model, how often, and the most recent call.</p>
+</header>
+
+<div class="strip">
+  <div class="stat"><b>10,677</b><span>logged calls in 30 days</span></div>
+  <div class="stat"><b>6,944</b><span>Mac Studio</span></div>
+  <div class="stat"><b>3,715</b><span>VPS, incl. 1,363 from websites</span></div>
+  <div class="stat"><b>18</b><span>MacBook Pro</span></div>
+  <div class="stat"><b>0</b><span>Remote Mac (no wrapper log)</span></div>
+</div>
+
+<div class="notes">
+  <div class="note good">
+    <h3>What the logs tell you</h3>
+    <ul>
+      <li>The exact time of every call, to the second</li>
+      <li>Which script made it, and the chain of programs that started it</li>
+      <li>The machine and folder it ran from</li>
+      <li>The model requested and the first words of the prompt</li>
+      <li>Whether it succeeded</li>
+    </ul>
+  </div>
+  <div class="note gap">
+    <h3>What they leave out</h3>
+    <ul>
+      <li><b>Which Claude account paid.</b> Nothing records whether a call ran on your account or Nick's.</li>
+      <li><b>Tokens or cost.</b> Only prompt length in characters.</li>
+      <li><b>Which website</b> sent a bridge request. The bridge only names the app in its failure log.</li>
+      <li>Interactive Claude Code sessions in the VS Code and Chrome panels. Those never go through the wrapper.</li>
+      <li>One image path in the bridge that calls Claude directly and skips the wrapper.</li>
+    </ul>
+  </div>
+  <div class="note watch">
+    <h3>Worth a look</h3>
+    <ul>
+      <li><b>Upwork scorer</b>: 432 calls on the default model (Opus), each with a prompt of about 136,000 characters. Likely the heaviest single job.</li>
+      <li><b>Heartbeat</b>: 1,417 "say ok" pings on the default model (Opus) where Haiku would do.</li>
+      <li><b>Account probes</b>: about 1,000 "Reply with ok" calls from the account switcher.</li>
+    </ul>
+  </div>
+</div>
+
+<div class="tools">
+  <input id="filter" type="search" placeholder="Filter: books, quotes, Go Kart Park, opus" aria-label="Filter services">
+  <div class="legend">Models:
+    <span class="pill opus">Opus / default</span><span class="pill sonnet">Sonnet</span><span class="pill haiku">Haiku</span>
+  </div>
+</div>
+
+<section class="machine">
+  <div class="mhead"><h2>VPS</h2><span class="meta">Always on · 3,715 calls · cron jobs, services, and the website bridge</span></div>
+  <div class="tablebox"><table>
+    <thead><tr><th>Service</th><th>How it starts</th><th>Model</th><th class="n">Calls</th><th>Last call</th><th>Source</th></tr></thead>
+    <tbody>
+      <tr><td><span class="svc">Account switch probe</span><span class="why">"Reply with ok" every 15 min to test which account works</span></td><td><span class="pill trig">Cron · every 15 min</span></td><td><span class="pill haiku">Haiku</span></td><td class="n">891</td><td class="when">Oct 20, 11:37 AM</td><td><code>cc/bin/claude-account auto</code></td></tr>
+      <tr><td><span class="svc">Books site</span><span class="why">Shelves books, Dewey classification, cleans Amazon listings. Almost all of it was a one-time bulk run: 144 calls on Sep 25 and 684 on Sep 27. Otherwise dormant, a few calls a week, and none on Oct 19–20.</span></td><td><span class="pill trig">Website → bridge</span></td><td><span class="pill opus">Opus</span></td><td class="n">≈850</td><td class="when">Oct 17</td><td><code>james-ai-library · books.jameshurst.com</code></td></tr>
+      <tr><td><span class="svc">Upwork job scorer</span><span class="why">Scores Upwork postings for you; very large prompts</span> <span class="pill flag">Heavy</span></td><td><span class="pill trig">Cron · 6 AM, 2 PM</span></td><td><span class="pill opus">Default (Opus)</span></td><td class="n">432</td><td class="when">Oct 20, 6:37 AM</td><td><code>upwork-scanner/score.py</code></td></tr>
+      <tr><td><span class="svc">Social listener</span><span class="why">Reads Facebook groups and scores posts as leads for HighLevel, All Things Handy and others</span></td><td><span class="pill trig">Cron · 9:40 AM daily</span></td><td><span class="pill opus">Default (Opus)</span></td><td class="n">351</td><td class="when">Oct 20, 10:56 AM</td><td><code>social-listener/daily_listen.py</code></td></tr>
+      <tr><td><span class="svc">Bridge health pings</span><span class="why">"Reply with ok" to check the bridge can reach Claude</span></td><td><span class="pill trig">Cron · every 15 min</span></td><td><span class="pill haiku">Haiku</span></td><td class="n">≈225</td><td class="when">Oct 17, 4:33 PM</td><td><code>claude-p-http/deploy/health-probe.sh</code></td></tr>
+      <tr><td><span class="svc">Gmail "needs James" triage</span><span class="why">Decides which emails need you and drafts next steps</span></td><td><span class="pill trig">Service → bridge</span></td><td><span class="pill sonnet">Sonnet</span></td><td class="n">≈215</td><td class="when">Oct 20, 12:02 PM</td><td><code>gmail-helper/needs-james</code></td></tr>
+      <tr><td><span class="svc">All Things Handy voice AI auditor</span><span class="why">Compares real calls against what the voice agent said</span></td><td><span class="pill trig">Webhook service</span></td><td><span class="pill sonnet">Sonnet</span></td><td class="n">199</td><td class="when">Oct 19, 6:00 PM</td><td><code>ai-assistant/webhook_server.py</code></td></tr>
+      <tr><td><span class="svc">Go Kart Park CRM scanner</span><span class="why">Sales manager pass over every Power Wheels lead</span></td><td><span class="pill trig">Cron · 8 AM daily</span></td><td><span class="pill sonnet">Sonnet</span></td><td class="n">186</td><td class="when">Oct 20, 8:01 AM</td><td><code>claude-code-crm/crm_scanner.py</code></td></tr>
+      <tr><td><span class="svc">Go Kart Park website chat</span><span class="why">Friendly assistant answering visitors</span></td><td><span class="pill trig">Always-on service</span></td><td><span class="pill opus">Default (Opus)</span></td><td class="n">117</td><td class="when">Oct 19, 6:46 AM</td><td><code>claude-code-crm.service · server.py</code></td></tr>
+      <tr><td><span class="svc">Quotes site</span><span class="why">Reads quote images, categorizes quotes</span></td><td><span class="pill trig">Website → bridge</span></td><td><span class="pill haiku">Haiku</span></td><td class="n">≈58</td><td class="when">Oct 13, 1:43 PM</td><td><code>entrepreneur-quotes · claude-p.jameshurst.com</code></td></tr>
+      <tr><td><span class="svc">Go Kart Park party reminders</span><span class="why">Writes party countdown emails</span></td><td><span class="pill trig">Cron · hourly</span></td><td><span class="pill opus">Default (Opus)</span></td><td class="n">49</td><td class="when">Oct 17, 9:00 AM</td><td><code>claude-code-crm/party_countdown.py</code></td></tr>
+      <tr><td><span class="svc">Go Kart Park review replies</span><span class="why">Drafts public replies to Google reviews</span></td><td><span class="pill trig">Cron · hourly at :12</span></td><td><span class="pill opus">Default (Opus)</span></td><td class="n">32</td><td class="when">Oct 10, 7:50 AM</td><td><code>claude-code-crm/review_monitor.py</code></td></tr>
+      <tr><td><span class="svc">Facebook group welcome email</span><span class="why">Writes welcome emails as you, the group owner</span></td><td><span class="pill trig">Service</span></td><td><span class="pill opus">Default (Opus)</span></td><td class="n">18</td><td class="when">Sep 29, 6:25 PM</td><td><code>email-server.py</code></td></tr>
+      <tr><td><span class="svc">All Things Handy call screener</span><span class="why">Screens inbound calls and texts, decides if a lead qualifies</span></td><td><span class="pill trig">Service + manual tests</span></td><td><span class="pill sonnet">Sonnet</span><span class="pill opus">Default</span></td><td class="n">14</td><td class="when">Oct 13, 5:03 PM</td><td><code>allthingshandy/scripts/call-screener</code></td></tr>
+      <tr><td><span class="svc">All Things Handy daily digest</span><span class="why">CRM summary for Wayne</span></td><td><span class="pill trig">Cron</span></td><td><span class="pill haiku">Haiku</span></td><td class="n">9</td><td class="when">Oct 16, 10:03 AM</td><td><code>ath-daily-digest.py</code></td></tr>
+      <tr><td><span class="svc">CRM weekly review, YouTube comment triage</span><span class="why">Engineering review of the CRM; classifies YouTube comments</span></td><td><span class="pill trig">Cron · weekly / 4× daily</span></td><td><span class="pill opus">Default (Opus)</span></td><td class="n">8</td><td class="when">Oct 13, 10:00 PM</td><td><code>daily_review.py · youtube-auto-commenter</code></td></tr>
+      <tr><td><span class="svc">Google Business Profile posts</span><span class="why">Weekly Go Kart Park post drafts</span></td><td><span class="pill trig">Cron · Monday 9 AM</span></td><td><span class="pill opus">Opus 5.5</span></td><td class="n">6</td><td class="when">Oct 19, 9:00 AM</td><td><code>client-context/gbp_posts.py</code></td></tr>
+      <tr><td><span class="svc">Zoom post-call assistant</span><span class="why">Summarizes a call when Zoom ends</span></td><td><span class="pill trig">Service → bridge</span></td><td><span class="pill sonnet">Sonnet</span></td><td class="n">4</td><td class="when">Oct 13, 1:53 PM</td><td><code>zoom-helper/call-done</code></td></tr>
+      <tr><td><span class="svc">Manual tests and one-offs</span><span class="why">Test runs over SSH, scratch scripts</span></td><td><span class="pill trig">Manual</span></td><td><span class="pill opus">Mixed</span></td><td class="n">≈40</td><td class="when">Oct 18</td><td><code>various</code></td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section class="machine">
+  <div class="mhead"><h2>Mac Studio</h2><span class="meta">6,944 calls · launchd jobs and local tools</span></div>
+  <div class="tablebox"><table>
+    <thead><tr><th>Service</th><th>How it starts</th><th>Model</th><th class="n">Calls</th><th>Last call</th><th>Source</th></tr></thead>
+    <tbody>
+      <tr><td><span class="svc">Session namer</span><span class="why">Names your Claude Code sessions and tags their repo</span></td><td><span class="pill trig">launchd · drift timer</span></td><td><span class="pill haiku">Haiku</span></td><td class="n">2,473</td><td class="when">Oct 20, 12:15 PM</td><td><code>vscode-session-namer/propose-session-name.py</code></td></tr>
+      <tr><td><span class="svc">claude-p heartbeat</span><span class="why">"say ok" to prove claude-p still works</span> <span class="pill flag">Opus for a ping</span></td><td><span class="pill trig">launchd</span></td><td><span class="pill opus">Default (Opus)</span></td><td class="n">1,417</td><td class="when">Oct 20, 11:53 AM</td><td><code>com.claude-p-wrapper.heartbeat</code></td></tr>
+      <tr><td><span class="svc">Mason SOP classifier</span><span class="why">Reads each git commit and decides if it is worth an SOP</span></td><td><span class="pill trig">Automatic (trigger not traced)</span></td><td><span class="pill haiku">Haiku</span></td><td class="n">1,302</td><td class="when">Oct 20, 12:15 PM</td><td><code>mason-system/sop_ai_classify.py</code></td></tr>
+      <tr><td><span class="svc">Meal tracker photo scan</span><span class="why">Checks new photos for food you ate</span></td><td><span class="pill trig">launchd · meal-tracker</span></td><td><span class="pill opus">Default (Opus)</span></td><td class="n">1,050</td><td class="when">Oct 20, 11:33 AM</td><td><code>meal-tracker/meal-scan.py</code></td></tr>
+      <tr><td><span class="svc">All Things Handy caller labels</span><span class="why">Labels each handyman customer's request</span></td><td><span class="pill trig">Started from a Claude session</span></td><td><span class="pill haiku">Haiku</span></td><td class="n">367</td><td class="when">Oct 19, 9:42 AM</td><td><code>ath-caller-context-sync.py</code></td></tr>
+      <tr><td><span class="svc">Token relay probe</span><span class="why">"Reply with ok" to check the shared login</span></td><td><span class="pill trig">launchd · token relay</span></td><td><span class="pill haiku">Haiku</span></td><td class="n">127</td><td class="when">Oct 16, 12:33 AM</td><td><code>com.cc.claude-token-relay</code></td></tr>
+      <tr><td><span class="svc">Voice requests</span><span class="why">Things you asked for by voice</span></td><td><span class="pill trig">Voice relay service</span></td><td><span class="pill opus">Default (Opus)</span></td><td class="n">75</td><td class="when">Oct 17, 7:57 AM</td><td><code>vfi-relay.py</code></td></tr>
+      <tr><td><span class="svc">Transcript cleanup</span><span class="why">Judgment pass in the First Pass transcript app</span></td><td><span class="pill trig">App</span></td><td><span class="pill opus">Opus 4.6</span></td><td class="n">51</td><td class="when">Sep 23, 2:39 PM</td><td><code>transcript-cleanup · First Pass</code></td></tr>
+      <tr><td><span class="svc">Account probes and tests</span><span class="why">claude-account checks and manual tests</span></td><td><span class="pill trig">Manual / switcher</span></td><td><span class="pill haiku">Mostly Haiku</span></td><td class="n">26</td><td class="when">Oct 20, 11:36 AM</td><td><code>claude-account</code></td></tr>
+      <tr><td><span class="svc">Small and one-off</span><span class="why">Voice-first app, social listener one-offs, post-call test, generators, tests</span></td><td><span class="pill trig">Mixed</span></td><td><span class="pill opus">Mixed</span></td><td class="n">76</td><td class="when">Oct 17</td><td><code>various</code></td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section class="machine">
+  <div class="mhead"><h2>MacBook Pro</h2><span class="meta">18 calls · tests, the stop-hook judge, file organizer</span></div>
+  <div class="tablebox"><table>
+    <thead><tr><th>Service</th><th>How it starts</th><th>Model</th><th class="n">Calls</th><th>Last call</th><th>Source</th></tr></thead>
+    <tbody>
+      <tr><td><span class="svc">Tests and pings</span><span class="why">"say PONG" checks over SSH</span></td><td><span class="pill trig">Manual</span></td><td><span class="pill haiku">Mixed</span></td><td class="n">10</td><td class="when">Oct 17, 7:39 PM</td><td><code>timeout / python</code></td></tr>
+      <tr><td><span class="svc">Stop-hook judge, session namer, file organizer</span><span class="why">Figure-it-out audit, session titles, AI file organize</span></td><td><span class="pill trig">Hooks / app</span></td><td><span class="pill haiku">Haiku</span><span class="pill sonnet">Sonnet</span></td><td class="n">8</td><td class="when">Oct 11, 8:47 AM</td><td><code>figure-it-out-judge.py · organize_file.py</code></td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section class="machine">
+  <div class="mhead"><h2>Remote Mac</h2><span class="meta">No claude-p log · runs the Claude Chrome panel server</span></div>
+  <div class="tablebox"><table>
+    <thead><tr><th>Service</th><th>How it starts</th><th>Model</th><th class="n">Calls</th><th>Last call</th><th>Source</th></tr></thead>
+    <tbody>
+      <tr><td><span class="svc">Claude Chrome panel server</span><span class="why">Held a token for your account from Sep 14 until it was disabled on Oct 20. No Claude activity found since Oct 19.</span></td><td><span class="pill trig">Always-on service</span></td><td>—</td><td class="n">not logged</td><td class="when">—</td><td><code>claude-code-chrome-ext/server</code></td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section class="machine">
+  <div class="mhead"><h2>Checked, no Claude calls</h2></div>
+  <div class="tablebox"><table class="narrow">
+    <thead><tr><th>Project</th><th>Finding</th></tr></thead>
+    <tbody>
+      <tr><td><span class="svc">Gospel library</span></td><td>No code calls Claude. The only match was a local Claude Code settings file.</td></tr>
+    </tbody>
+  </table></div>
+</section>
+<p class="empty" id="nomatch" hidden>No service matches that filter.</p>
+
+<footer>
+  <p>Sources: <code>claude-p-usage.log</code> on the Studio, VPS and MacBook Pro (Sep 20 – Oct 20, 2026), VPS root and claude crontabs, running VPS services, Studio launchd agents, and a code search of 241 repos. Rows marked ≈ are grouped by prompt text, because the bridge does not log which website called.</p>
+  <p>Not covered: interactive Claude Code sessions, which do not go through claude-p. On the Studio those came to about $62.78 at API rates on Oct 19–20.</p>
+</footer>
+</div>
+
+<script>
+(function(){
+  var input=document.getElementById('filter'), none=document.getElementById('nomatch');
+  function run(){
+    var q=input.value.trim().toLowerCase(), any=false;
+    document.querySelectorAll('section.machine').forEach(function(sec){
+      var shown=0;
+      sec.querySelectorAll('tbody tr').forEach(function(tr){
+        var hit=!q||tr.textContent.toLowerCase().indexOf(q)>-1;
+        tr.hidden=!hit; if(hit) shown++;
+      });
+      sec.hidden=shown===0; if(shown) any=true;
+    });
+    none.hidden=any;
+  }
+  input.addEventListener('input',run);
+})();
+</script>
+</body>
+</html>
