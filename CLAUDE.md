@@ -25,6 +25,14 @@ Single-file Python 3 script. No dependencies beyond the stdlib. Runs on macOS an
 - One email per tier per hour to avoid flooding
 - The `EXEMPT_CALLERS` allowlist in `claude-p` bypasses the hard cap for event-driven callers (one user action equals one call). Timer-driven callers must never be exempted.
 
+## Failover Cascade (Max → API key → email)
+
+1. **Max subscription** (`claude -p` OAuth) is always tried first.
+2. If Max fails on **auth** (Not logged in / 401) **or usage/rate limit** (usage limit reached, 429), the wrapper answers the caller through the claude-login brain using the Anthropic API key `/anthropic/api-key`. "API credits" means spend on that one key; there is no second credential.
+3. Brain answered → email James immediately ("Max failed — using API credits"), deduped once per machine per reason per hour. Logged `error_category: brain_fallback`, `max_failure: <reason>`.
+4. Brain also failed or unavailable → email James immediately ("EVERYTHING FAILED"), no grace window, storm-guarded to one per machine per 20 minutes. Logged `error_category: total_failure` with `brain_error`. Stdout is suppressed and the call exits non-zero.
+5. For auth failures the separate grace-gated claude-login heal receipt still runs on top of this.
+
 ## Wrapper Version
 
 `WRAPPER_VERSION` at the top of `claude-p` tags every log line. Bump it whenever the log schema changes so older lines stay parseable. Adding a field is additive and does not require a bump; renaming or removing one does.

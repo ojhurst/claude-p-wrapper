@@ -41,7 +41,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-WRAPPER_VERSION = 9
+WRAPPER_VERSION = 10
 LOG_TZ = ZoneInfo("America/Denver")  # Utah Mountain Time, DST-aware
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -199,6 +199,7 @@ def diagnose_hour(caller: str) -> str:
 
         auth_hit = any(
             (e.get("error_signature") in _AUTH_TAGS)
+            or (e.get("max_failure") in ("api_auth_failure", "auth_failure"))
             or (e.get("error_category") in ("api_auth_failure", "auth_failure"))
             for e in failed
         )
@@ -642,35 +643,36 @@ def _flag_value(args, name: str):
 
 
 def brain_serve(args, stdin_data: bytes, model_name: str):
-    """Answer the current caller via the API-key brain. Returns stdout bytes to
-    emit (plain text, or a CLI-shaped JSON envelope when --output-format json),
-    or None if the brain is unavailable or the request can't be safely served."""
+    """Answer the current caller via the API-key brain. Returns (stdout_bytes,
+    reason): stdout_bytes is plain text, or a CLI-shaped JSON envelope when
+    --output-format json, or None if the brain is unavailable or the request
+    can't be safely served — in which case reason says why (for the email/log)."""
     out_fmt = (_flag_value(args, "--output-format") or "").lower()
     if out_fmt not in ("", "text", "json"):
-        return None  # stream-json etc. — don't risk a malformed degrade
+        return None, f"output format {out_fmt!r} can't be served by the brain"
     try:
         if str(CLAUDE_LOGIN_DIR) not in sys.path:
             sys.path.insert(0, str(CLAUDE_LOGIN_DIR))
         from claude_login import brain
-    except Exception:
-        return None
+    except Exception as e:
+        return None, f"claude-login brain not importable: {e}"
     if not brain.available():
-        return None
+        return None, "Anthropic API key (/anthropic/api-key) not reachable"
     argv_prompt = " ".join(a for a in args if not a.startswith("-"))
     full = argv_prompt
     if stdin_data:
         st = stdin_data.decode("utf-8", errors="replace")
         full = (argv_prompt + "\n" + st).strip() if argv_prompt else st
     if not full.strip():
-        return None
+        return None, "empty prompt"
     system = _flag_value(args, "--system-prompt") or _flag_value(args, "--append-system-prompt")
     try:
         text = brain.ask(full, system=system, model=map_model_to_api(model_name),
                          max_tokens=8192, timeout=90)
-    except Exception:
-        return None
+    except Exception as e:
+        return None, f"API-key call failed: {e}"
     if not text:
-        return None
+        return None, "API-key call returned no text"
     if out_fmt == "json":
         envelope = {
             "type": "result", "subtype": "success", "is_error": False,
@@ -678,8 +680,116 @@ def brain_serve(args, stdin_data: bytes, model_name: str):
             "total_cost_usd": 0, "brain_fallback": True,
             "usage": {"input_tokens": 0, "output_tokens": 0},
         }
-        return (json.dumps(envelope) + "\n").encode()
-    return (text.rstrip("\n") + "\n").encode()
+        return (json.dumps(envelope) + "\n").encode(), ""
+    return (text.rstrip("\n") + "\n").encode(), ""
+
+
+# ── Max → API key → email failover cascade ─────────────────────────────────────
+# 1. Max subscription (`claude -p` OAuth) is always tried first.
+# 2. If Max fails on auth OR usage/rate limit, the API-key brain answers instead.
+#    "API credits" = spend on that one key (/anthropic/api-key); there is no
+#    second credential.
+# 3. Brain served it → email James right away that Max failed and the key paid.
+# 4. Brain also failed → email James right away that everything failed. No grace.
+
+# Shapes the CLI prints when the Max plan is out of allowance or throttled.
+# Only matched on a failed, short response so real model output can't trip it.
+USAGE_LIMIT_MARKERS = (
+    "usage limit reached",
+    "hit your limit",
+    "5-hour limit reached",
+    "weekly limit reached",
+    "API Error: 429",
+    "rate_limit_error",
+)
+USAGE_LIMIT_SCAN_BYTES = 4096
+FAILOVER_ALERT_COOLDOWN_S = 3600       # one "used the API key" email per reason per hour
+TOTAL_FAILURE_ALERT_COOLDOWN_S = 20 * 60  # "everything failed" storm guard
+
+MAX_FAILURE_PLAIN = {
+    "auth_failure":     "the Max login is signed out ('Not logged in')",
+    "api_auth_failure": "the Max login token was rejected (HTTP 401)",
+    "usage_limit":      "the Max plan hit its usage or rate limit",
+}
+
+
+def is_usage_limit(stdout_bytes: bytes, stderr_bytes: bytes, exit_code: int) -> bool:
+    """Detect Max usage/rate-limit failures. The CLI either exits non-zero or
+    returns a JSON envelope with is_error:true; a normal answer never counts."""
+    out = (stdout_bytes or b"")[:USAGE_LIMIT_SCAN_BYTES].decode("utf-8", errors="ignore")
+    err = (stderr_bytes or b"")[-USAGE_LIMIT_SCAN_BYTES:].decode("utf-8", errors="ignore")
+    failed = exit_code != 0
+    if not failed and out.lstrip().startswith("{"):
+        try:
+            failed = bool(json.loads(out).get("is_error"))
+        except Exception:
+            failed = False
+    if not failed or len(stdout_bytes or b"") > USAGE_LIMIT_SCAN_BYTES:
+        return False
+    text = (out + "\n" + err).lower()
+    return any(m.lower() in text for m in USAGE_LIMIT_MARKERS)
+
+
+def _cooled_down(flag: Path, cooldown_s: int) -> bool:
+    """True (and stamps the flag) if no email went out under this flag recently."""
+    try:
+        if flag.exists() and (time.time() - flag.stat().st_mtime) < cooldown_s:
+            return False
+        flag.touch()
+    except Exception:
+        pass
+    return True
+
+
+def _failure_detail(stdout_bytes: bytes, stderr_bytes: bytes, exit_code: int) -> str:
+    sig = extract_error_signature(stdout_bytes, stderr_bytes, exit_code or 1)
+    return sig or f"exit {exit_code}"
+
+
+def email_failover(machine: str, max_failure: str, caller: str, detail: str) -> None:
+    """Max failed, the API key answered. One email per machine/reason per hour."""
+    if not _cooled_down(Path(f"/tmp/claude-p-failover-{machine}-{max_failure}"),
+                        FAILOVER_ALERT_COOLDOWN_S):
+        return
+    why = MAX_FAILURE_PLAIN.get(max_failure, max_failure)
+    when = datetime.now(LOG_TZ).strftime("%-I:%M %p %Z")
+    send_alert_email(
+        subject=f"[claude-p] Max failed on {machine} — using API credits",
+        body=(
+            f"At {when}, `claude -p` on {machine} could not use your Max subscription "
+            f"because {why}.\n\n"
+            f"The call from {caller} was answered with the Anthropic API key "
+            f"(/anthropic/api-key) instead, so this is spending API credits.\n\n"
+            f"Detail from the CLI: {detail}\n\n"
+            "Calls keep falling over to the API key until Max works again. You get at "
+            "most one of these per hour for this reason.\n"
+            + ("\nFix: on that machine run `claude /login`.\n"
+               if max_failure != "usage_limit" else
+               "\nNothing to fix unless the limit is a surprise; Max resumes when it resets.\n")
+        ),
+    )
+
+
+def email_total_failure(machine: str, max_failure: str, caller: str,
+                        detail: str, brain_reason: str) -> None:
+    """Max AND the API key both failed. Immediate, storm-guarded to ~20 min."""
+    if not _cooled_down(Path(f"/tmp/claude-p-total-failure-{machine}"),
+                        TOTAL_FAILURE_ALERT_COOLDOWN_S):
+        return
+    why = MAX_FAILURE_PLAIN.get(max_failure, max_failure)
+    when = datetime.now(LOG_TZ).strftime("%-I:%M %p %Z")
+    send_alert_email(
+        subject=f"[claude-p] EVERYTHING FAILED on {machine} — no AI answering",
+        body=(
+            f"At {when}, `claude -p` on {machine} has no working AI.\n\n"
+            f"1. Max subscription failed: {why}. ({detail})\n"
+            f"2. Anthropic API key fallback failed: {brain_reason}\n\n"
+            f"The call from {caller} got no answer, and every other caller on this "
+            "machine is failing the same way.\n\n"
+            "Fix: on that machine run `claude /login`, and check the API key "
+            "balance at console.anthropic.com.\n"
+        ),
+    )
 
 
 # ── Auth-failure escalation: grace-gated, PONG-verified, smart receipt ─────────
@@ -692,14 +802,16 @@ def auth_outage_minutes() -> float:
             return 0.0
         with LOG_FILE.open() as f:
             lines = f.readlines()[-200:]
-        down = {"auth_failure", "api_auth_failure", "brain_fallback"}
+        down = {"auth_failure", "api_auth_failure", "brain_fallback", "total_failure"}
         streak_start = None
         for line in reversed(lines):
             try:
                 d = json.loads(line)
             except Exception:
                 continue
-            if d.get("error_category") in down:
+            # Pre-v10 brain_fallback lines were auth-only; usage-limit ones
+            # are not a login outage.
+            if d.get("error_category") in down and d.get("max_failure") != "usage_limit":
                 streak_start = d.get("ts")
                 continue
             break
@@ -803,7 +915,7 @@ def handle_auth_failure(machine: str, mode: str) -> None:
     if outage < GRACE_MIN:
         sys.stderr.write(
             f"[claude-p] auth failing ~{outage:.0f}m (<{GRACE_MIN}m grace) — holding "
-            f"alert; brain is serving callers. Will page only if it stays down.\n"
+            f"the login-heal receipt until it stays down (failover email already sent).\n"
         )
         return
 
@@ -1150,47 +1262,67 @@ def main():
     base_entry["recovery_attempted"] = recovery_attempted
     base_entry["recovery_succeeded"] = recovery_succeeded
 
-    # Fallback brain: if OAuth is still down, serve THIS caller via the API-key
-    # brain (a credential that survives the outage) so it gets a real answer
-    # instead of a failure. Skipped in inner mode to prevent recursion.
+    # Max → API key → email cascade. Max failed if OAuth is still down after
+    # recovery, or the plan hit its usage/rate limit. Either way, serve THIS
+    # caller via the API-key brain (a separate credential) so it gets a real
+    # answer, and tell James right away. Skipped in inner mode (no recursion).
+    usage_limited = (not (auth_failed or api_auth_failed)) and not streamed \
+        and is_usage_limit(stdout_buf, stderr_buf, exit_code)
+    max_failure = ("auth_failure" if auth_failed
+                   else "api_auth_failure" if api_auth_failed
+                   else "usage_limit" if usage_limited
+                   else "")
     served_by_brain = False
     brain_out = None
-    if (auth_failed or api_auth_failed) and not inner:
+    brain_reason = ""
+    if max_failure and not inner:
         try:
-            brain_out = brain_serve(args, stdin_data, parse_model(args))
-        except Exception:
-            brain_out = None
+            brain_out, brain_reason = brain_serve(args, stdin_data, parse_model(args))
+        except Exception as e:
+            brain_out, brain_reason = None, f"brain_serve error: {e}"
         served_by_brain = brain_out is not None
     base_entry["brain_fallback"] = served_by_brain
+    if max_failure:
+        base_entry["max_failure"] = max_failure
+    if brain_reason:
+        base_entry["brain_error"] = brain_reason[:300]
 
-    if auth_failed or api_auth_failed:
+    if max_failure:
         machine = machine_tag()
-        mode = "cli" if auth_failed else "api"
+        detail = _failure_detail(stdout_buf, stderr_buf, exit_code)
         if served_by_brain:
             # Degraded mode: real answer via the API-key brain, exit clean.
             sys.stdout.buffer.write(brain_out)
             sys.stdout.flush()
             sys.stderr.write(
-                f"[claude-p] OAuth down on {machine} — served this call via the "
-                f"API-key brain (degraded mode). The login still needs a durable fix.\n"
+                f"[claude-p] Max failed on {machine} ({max_failure}) — served this "
+                f"call via the API-key brain (API credits).\n"
             )
             exit_code = 0
         else:
-            # No brain available — fail closed so callers don't consume the
-            # auth-error string as a result.
+            # Total failure — fail closed so callers don't consume the error
+            # string as a result.
             sys.stderr.write(
-                f"[claude-p] {'auth lapsed' if auth_failed else 'API 401'} on "
-                f"{machine} — suppressing stdout and exiting {AUTH_FAILURE_EXIT} "
-                f"(brain fallback unavailable). Fix: run `claude /login`.\n"
+                f"[claude-p] {max_failure} on {machine} and API-key brain failed "
+                f"({brain_reason or 'inner mode'}) — suppressing stdout, exiting "
+                f"{AUTH_FAILURE_EXIT if max_failure != 'usage_limit' else (exit_code or 1)}.\n"
             )
-            exit_code = AUTH_FAILURE_EXIT
+            exit_code = AUTH_FAILURE_EXIT if max_failure != "usage_limit" else (exit_code or 1)
         sys.stderr.flush()
         if not inner:
-            # Grace-gated, PONG-verified, smart-receipt escalation.
             try:
-                handle_auth_failure(machine, mode)
+                if served_by_brain:
+                    email_failover(machine, max_failure, caller, detail)
+                else:
+                    email_total_failure(machine, max_failure, caller, detail, brain_reason)
             except Exception as e:
-                sys.stderr.write(f"[claude-p] escalation error: {e}\n")
+                sys.stderr.write(f"[claude-p] failover email error: {e}\n")
+            if max_failure != "usage_limit":
+                # Login heal: grace-gated, PONG-verified, smart-receipt escalation.
+                try:
+                    handle_auth_failure(machine, "cli" if auth_failed else "api")
+                except Exception as e:
+                    sys.stderr.write(f"[claude-p] escalation error: {e}\n")
     else:
         # Forward stdout unchanged so callers keep getting claude's output.
         # In streaming mode everything past the gate already went out; only the
@@ -1210,6 +1342,7 @@ def main():
     stderr_tail = stderr_buf.decode(errors="replace")[-400:]
     error_category = (
         "brain_fallback" if served_by_brain
+        else "total_failure" if (max_failure and not inner)
         else "auth_failure" if auth_failed
         else "api_auth_failure" if api_auth_failed
         else classify_error(exit_code, stderr_tail)
