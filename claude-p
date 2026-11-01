@@ -424,13 +424,122 @@ SDK_MODEL_MAP = {
 SDK_MAX_TOKENS = 16384
 
 
-def _fleet_access_token(min_secs=600):
+CLAUDE_AUTH = Path.home() / "apps" / "cc" / "bin" / "claude-auth"
+CLAUDE_ACCOUNT = Path.home() / "apps" / "cc" / "bin" / "claude-account"
+
+
+def _claude_auth(*args, stdin=""):
+    """Run the claude-auth resolver (cc/bin/claude-auth). Returns (returncode, stdout);
+    (-1, "") when it is missing or crashed, so callers keep the legacy behaviour."""
+    if not CLAUDE_AUTH.exists():
+        return -1, ""
+    try:
+        p = subprocess.run([sys.executable, str(CLAUDE_AUTH), *args], input=stdin,
+                           capture_output=True, text=True, timeout=120)
+        return p.returncode, p.stdout.strip()
+    except Exception:
+        return -1, ""
+
+
+def select_auth_env(env):
+    """Point env at the ACTIVE account's credential (claude-account / claude-auth).
+    Returns True when it injected a fleet access token (the 401 retry re-injects).
+
+    - claude-account probe (CLAUDE_AUTH_PROBE): honour the exact token it set; an
+      empty one means "this machine's fleet login", never the setup-token file.
+    - A caller that pinned its own token keeps it; the account guard judges it.
+    - setup-token account: the token claude-auth hands back.
+    - fleet-login account: drop any inherited token; on macOS hand the CLI the fresh
+      fleet access token (the Keychain login goes stale after a switch).
+    - resolver missing / not applied: the legacy file-first order below.
+    """
+    tok_key, src_key = "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN_SOURCE"
+    inherited = env.get(tok_key)
+    if os.environ.get("CLAUDE_AUTH_PROBE"):
+        if not inherited and sys.platform == "darwin":
+            lt = _fleet_access_token(skip_file=True)
+            if lt:
+                env[tok_key] = lt
+                return True
+        return False
+    if inherited and env.get(src_key, "") not in ("launchd-env", "claude-auth"):
+        return False
+    rc, tok = _claude_auth("token")
+    if rc == 0 and tok:
+        env[tok_key], env[src_key] = tok, "claude-auth"
+        return False
+    if rc == 3:
+        env.pop(tok_key, None)
+        env.pop(src_key, None)
+        if sys.platform == "darwin":
+            lt = _fleet_access_token(skip_file=True)
+            if lt:
+                env[tok_key] = lt
+                return True
+        return False
+    # Legacy: machine-local long-lived token (claude setup-token, 1-year lifetime) wins
+    # over .credentials.json; on macOS fall back to the fresh fleet access token, also
+    # overriding a token inherited from `launchctl setenv`, which can be older than the file.
+    token_file = Path.home() / ".claude" / "oauth-token"
+    if tok_key not in env and token_file.exists():
+        lt = token_file.read_text().strip()
+        if lt.startswith("sk-ant-") and len(lt) > 80:
+            env[tok_key] = lt
+    if sys.platform == "darwin" and (not env.get(tok_key) or env.get(src_key) == "launchd-env"):
+        lt = _fleet_access_token()
+        if lt:
+            env[tok_key] = lt
+            return True
+    return False
+
+
+def account_guard(env):
+    """Does the token about to be used belong to the active account? Hash compare via
+    claude-auth guard — local files only, no API call. Returns the verdict dict
+    (account, using, hash, verdict[, reason]); never contains a token."""
+    probe = os.environ.get("CLAUDE_AUTH_PROBE")
+    rc, out = _claude_auth("guard", stdin=env.get("CLAUDE_CODE_OAUTH_TOKEN", ""))
+    try:
+        g = json.loads(out)
+    except Exception:
+        g = {"verdict": "unavailable"}
+    if probe:
+        g["verdict"], g["probe"] = "probe", probe
+    elif rc == 5:
+        g["verdict"] = "mismatch"
+    return g
+
+
+def refuse_on_account_mismatch(env, base_entry):
+    """Log the account on every call (name + 12-char hash). On a mismatch with the active
+    account: refuse (exit 78, nothing reaches the API), and run `claude-account apply`
+    so the next call is on the right account."""
+    g = account_guard(env)
+    base_entry["account"] = g.get("active")
+    base_entry["auth_using"] = g.get("using")
+    base_entry["auth_hash"] = g.get("hash")
+    base_entry["auth_verdict"] = g.get("verdict")
+    if g.get("verdict") != "mismatch":
+        return
+    sys.stderr.write(f"[claude-p] refused: account mismatch — {g.get('reason', '')}. "
+                     "Ran claude-account apply; retry the call.\n")
+    try:
+        subprocess.run(["bash", str(CLAUDE_ACCOUNT), "apply"], capture_output=True, timeout=120)
+    except Exception:
+        pass
+    log({**base_entry, "backend": "cli", "exit_code": AUTH_FAILURE_EXIT,
+         "error_category": "account_mismatch"})
+    sys.exit(AUTH_FAILURE_EXIT)
+
+
+def _fleet_access_token(min_secs=600, skip_file=False):
     """Fresh access token for the CLI on macOS: ~/.claude/oauth-token (setup-token) if
-    present, else .credentials.json's accessToken, pulling from Parameter Store when it
-    has < min_secs left. Never refreshes OAuth itself. Returns None if nothing usable."""
+    present (unless skip_file), else .credentials.json's accessToken, pulling from
+    Parameter Store when it has < min_secs left. Never refreshes OAuth itself. Returns
+    None if nothing usable."""
     try:
         tf = Path.home() / ".claude" / "oauth-token"
-        if tf.exists():
+        if not skip_file and tf.exists():
             lt = tf.read_text().strip()
             if lt.startswith("sk-ant-") and len(lt) > 80:
                 return lt
@@ -962,6 +1071,13 @@ def build_image_preamble(image_paths):
 
 
 def main():
+    # Auth dry run (claude-account verify): the real auth selection + account guard,
+    # then exit — no CLI call, no API call, nothing counted or logged.
+    if os.environ.get("CLAUDE_P_AUTH_DRYRUN"):
+        env = dict(os.environ)
+        select_auth_env(env)
+        print(json.dumps(account_guard(env)))
+        sys.exit(0)
     raw_args = sys.argv[1:]
     args, image_paths = extract_images(raw_args)
     caller = detect_caller()
@@ -1114,28 +1230,11 @@ def main():
         # (timestamp banner, context bar, commit-status line, model tag) detect
         # a headless call and skip themselves, keeping output strict for parsers.
         env = {**os.environ, "CLAUDE_NONINTERACTIVE": "1", "CLAUDE_P_AUTOMATION": "1"}
-        # Machine-local long-lived token (claude setup-token, 1-year lifetime).
-        # If ~/.claude/oauth-token exists, it wins over .credentials.json — this
-        # frees headless boxes (VPS) from the MBP keychain-harvest sync chain.
-        # Backup copy: Parameter Store /claude/vps/CLAUDE_CODE_OAUTH_TOKEN.
-        token_file = Path.home() / ".claude" / "oauth-token"
-        if "CLAUDE_CODE_OAUTH_TOKEN" not in env and token_file.exists():
-            lt = token_file.read_text().strip()
-            if lt.startswith("sk-ant-") and len(lt) > 80:
-                env["CLAUDE_CODE_OAUTH_TOKEN"] = lt
-        # macOS: the bare CLI reads the Keychain login, not .credentials.json. After a
-        # claude-account switch to a fleet-login account (e.g. nick) the Keychain still
-        # holds the old login, whose refresh fails (HTTP 400). Hand the CLI the fresh
-        # fleet access token instead (pulling from Parameter Store first if the local copy
-        # is stale; VPS stays the sole refresher). Also override a token inherited from
-        # `launchctl setenv` (claude-launchd-env), which can be older than the file.
-        _injected = False
-        if sys.platform == "darwin" and (not env.get("CLAUDE_CODE_OAUTH_TOKEN")
-                                         or env.get("CLAUDE_CODE_OAUTH_TOKEN_SOURCE") == "launchd-env"):
-            _lt = _fleet_access_token()
-            if _lt:
-                env["CLAUDE_CODE_OAUTH_TOKEN"] = _lt
-                _injected = True
+        # The active account's credential, picked by the claude-auth resolver
+        # (fleet-wide switch: ~/apps/cc/bin/claude-account), then checked by the
+        # account guard. See select_auth_env / account_guard.
+        _injected = select_auth_env(env)
+        refuse_on_account_mismatch(env, base_entry)
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,

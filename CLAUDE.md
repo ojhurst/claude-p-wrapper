@@ -33,6 +33,15 @@ Single-file Python 3 script. No dependencies beyond the stdlib. Runs on macOS an
 4. Brain also failed or unavailable → email James immediately ("EVERYTHING FAILED"), no grace window, storm-guarded to one per machine per 20 minutes. Logged `error_category: total_failure` with `brain_error`. Stdout is suppressed and the call exits non-zero.
 5. For auth failures the separate grace-gated claude-login heal receipt still runs on top of this.
 
+## Account Guard (Build 27)
+
+Which Claude account the CLI runs on comes from the fleet-wide switch `~/apps/cc/bin/claude-account`, read through the resolver `~/apps/cc/bin/claude-auth` (`select_auth_env`). The wrapper never reads `~/.claude/oauth-token` itself unless the resolver is missing.
+
+- Every call logs `account`, `auth_using`, `auth_hash` (12 chars) and `auth_verdict`. Never the token.
+- Before the CLI starts, `claude-auth guard` hash-compares the token about to be used with the active account (local files, no API call). Mismatch: stderr `[claude-p] refused: account mismatch — …`, runs `claude-account apply`, exits **78**, logs `error_category: account_mismatch`. Nothing reaches the API and the failover cascade does not run, so a mismatch never falls to the API key.
+- A caller that pins its own `CLAUDE_CODE_OAUTH_TOKEN` keeps it, and the guard judges it. `claude-account`'s probe sets `CLAUDE_AUTH_PROBE=<name>` to test a non-active account on purpose.
+- `CLAUDE_P_AUTH_DRYRUN=1 claude-p` prints the auth verdict as JSON and exits without calling the CLI (used by `claude-account verify`).
+
 ## Wrapper Version
 
 `WRAPPER_VERSION` at the top of `claude-p` tags every log line. Bump it whenever the log schema changes so older lines stay parseable. Adding a field is additive and does not require a bump; renaming or removing one does.
