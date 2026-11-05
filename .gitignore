@@ -8,3 +8,5 @@ secrets.env
 .env
 secrets.json
 shared-secrets.json
+# Timestamped backups (claude-p.bak-YYYYMMDD-HHMMSS)
+*.bak-*
